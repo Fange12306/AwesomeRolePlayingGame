@@ -50,6 +50,7 @@
 - `world/regions.json`：大陆/区域与地理骨架。
 - `world/nations.json`：国家/势力、政体与关系骨架。
 - `world/tech_society.json`：科技、经济、文化、军事基线。
+- `world/characters.json`：当前叙事涉及的角色信息（身份、角色定位、所属势力、与玩家的关系）。
 
 **约束**：
 - 初始化仅生成骨架。
@@ -72,6 +73,7 @@
 
 ### 存档数据（`saves/<save_id>/`）
 - `saves/<save_id>/world/*`
+- `saves/<save_id>/world/characters.json`
 - `saves/<save_id>/plot/*`
 - `saves/<save_id>/rules/*`
 - `saves/<save_id>/state.json`：当前 Arc/Scene、角色快照、schema 版本。

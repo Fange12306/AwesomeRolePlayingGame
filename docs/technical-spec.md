@@ -50,6 +50,7 @@ This document defines the technical specification for a multi-agent, LLM-driven 
 - `world/regions.json`: Continents/regions, geography skeleton.
 - `world/nations.json`: Nations/factions, governance, alliances (scaffold).
 - `world/tech_society.json`: Baseline tech, economy, culture, military.
+- `world/characters.json`: In-scope characters for the current narrative (identities, roles, affiliations, relationships to the player).
 
 **Constraints**:
 - Initialization generates skeleton-only values.
@@ -72,6 +73,7 @@ This document defines the technical specification for a multi-agent, LLM-driven 
 
 ### Save Data (`saves/<save_id>/`)
 - `saves/<save_id>/world/*`
+- `saves/<save_id>/world/characters.json`
 - `saves/<save_id>/plot/*`
 - `saves/<save_id>/rules/*`
 - `saves/<save_id>/state.json`: Current Arc/Scene, character snapshots, schema versions.
