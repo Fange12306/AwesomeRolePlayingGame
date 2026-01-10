@@ -8,97 +8,14 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from llm_api.llm_client import LLMClient
-from world.world_prompt import WorldPromptBuilder
-
-
-DEFAULT_WORLD_SPEC = """
-第一维度：世界基石 (The Foundation & Stage)
-——决定了“我们在哪里”以及“规则是什么”
-
-这是世界的物理容器和运行法则，是一切模拟的前提。
-
-1.1 现实定性
-
-1.1.1 核心法则
-纯科技侧：严谨的物理规则（如：现实地球、硬科幻、末日废土）。
-高魔/超凡侧：唯心力量主导（如：修仙、神话、魔法中世纪）。
-混合侧：科技与神秘共存（如：赛博修真、蒸汽朋克+克苏鲁）。
-1.1.2 铁律/代价
-世界中绝对不可违背的一条规则是什么？（例如：人死不能复生、魔法必须等价交换、光速不可逾越）。
-1.2 地理容器
-
-1.2.1 世界形态
-行星级：常规星球（如：地球、火星）。
-破碎/特殊：非星球结构（如：漂浮空岛群、无尽平面、巨大宇宙飞船内部、地底空洞）。
-1.2.2 主导地貌
-地图上占比最大的环境是什么？（如：90%是海洋、全境沙漠化、无尽的钢铁都市、被森林覆盖）。
-1.2.3 物理边界
-阻挡人们探索世界尽头的是什么？（如：致命辐射带、深海、无法穿越的迷雾、宇宙真空）。
-1.3 核心驱动力
-
-1.3.1 能量来源
-世界运转靠什么？（石油/电能、灵气/魔力、晶石、太阳能）。
-1.3.2 资源状态
-该能量是无限且廉价（冲突在于谁更强），还是枯竭且昂贵（冲突在于生存）？
-第二维度：文明进程 (Civilization & History)
-——决定了“世界目前处于什么阶段”
-
-这部分决定了模拟的背景故事厚度和技术/魔法水平。
-
-2.1 文明所处阶段
-
-2.1.1 发展水平
-原始/蒙昧：部落制，生存为主。
-发展/扩张：国家建立，正在探索世界。
-巅峰/繁荣：技术或魔法高度发达，生活富足。
-衰退/末世：文明崩溃后，在废墟上苟延残喘。
-2.1.2 技术/魔法普及度
-精英垄断：只有少部分人掌握核心力量。
-全民普及：力量或技术融入了普通人的日常生活。
-2.2 历史转折点
-
-2.2.1 创伤记忆
-近百年内发生过的最大灾难或战争是什么？（这解释了现在的格局）。
-2.2.2 遗留产物
-那次事件留下了什么？（如：禁区、仇恨、某种变异生物、被遗忘的黑科技）。
-第三维度：社会权力 (Power & Structure)
-——决定了“谁在统治”以及“谁在受苦”
-
-这部分构建了模拟中的NPC关系网和主要势力。
-
-3.1 统治实体
-
-3.1.1 最高权力机构
-形式：帝国皇室、企业联盟、宗教教廷、AI中枢、军阀割据。
-控制手段：依靠武力镇压、信仰洗脑、还是经济控制？
-3.1.2 反对势力
-谁在试图推翻统治者？（如：革命军、地下结社、异教徒）。
-3.2 阶级与分配
-
-3.2.1 阶级鸿沟
-上层阶级拥有什么特权？（如：永生、飞行、无尽的资源）。
-底层阶级面临什么困境？（如：饥饿、疾病、被奴役）。
-3.2.2 经济媒介
-一般等价物（货币）：人们用什么交易？（金银、信用点、电池、瓶盖、寿命）。
-硬通货：除了钱，什么东西最值钱？（水、抗生素、武器、信息）。
-第四维度：人文生态 (Culture & Lifestyle)
-——决定了“世界的真实氛围”
-
-这部分决定了模拟的沉浸感，涉及普通人的衣食住行。
-
-4.1 信仰与禁忌
-
-4.1.1 核心价值观
-社会普遍崇尚什么？（力量、金钱、神明、理性、荣誉）。
-4.1.2 绝对禁忌
-普通人绝对不敢做的事是什么？（如：直呼神名、夜晚出门、进入某个区域）。
-4.2 生存画风
-
-4.2.1 建筑与美学
-城市/居住地长什么样？（高耸的赛博高楼、破败的帐篷、宏伟的石质神庙、生物质生长的房屋）。
-4.2.2 饮食来源
-人们主要吃什么？（合成膏、自然作物、狩猎怪兽、能量块）。
-""".strip()
+from world.world_prompt import (
+    DEFAULT_WORLD_SPEC,
+    MICRO_POLITY_ASPECTS,
+    MICRO_POLITY_DESCRIPTION,
+    MICRO_REGION_DESCRIPTION,
+    MICRO_REGIONS,
+    WorldPromptBuilder,
+)
 
 
 @dataclass
@@ -128,11 +45,20 @@ class WorldEngine:
     ) -> None:
         self.world_md_path = Path(world_md_path) if world_md_path else None
         self.root = WorldNode(identifier="world", title="World")
-        self.nodes: Dict[str, WorldNode] = {"world": self.root}
+        self.macro = WorldNode(identifier="macro", title="Macro")
+        self.micro = WorldNode(identifier="micro", title="Micro")
+        self.root.add_child(self.macro)
+        self.root.add_child(self.micro)
+        self.nodes: Dict[str, WorldNode] = {
+            "world": self.root,
+            "macro": self.macro,
+            "micro": self.micro,
+        }
         self.llm_client = llm_client or LLMClient()
 
         spec_text = self._load_spec_text(world_spec_text)
         self._load_world_spec(spec_text)
+        self._seed_micro_structure()
 
     # Public API -----------------------------------------------------------------
     def view_node(self, identifier: str) -> WorldNode:
@@ -197,10 +123,12 @@ class WorldEngine:
                 continue
 
             parent_value = node.parent.value if node.parent else ""
+            extra_context = self._build_micro_uniqueness_context(node)
             prompt = WorldPromptBuilder.build_node_prompt(
                 user_pitch=user_pitch,
                 node=node,
                 parent_value=parent_value,
+                extra_context=extra_context,
             )
             node.value = self.llm_client.chat_once(
                 prompt, system_prompt=WorldPromptBuilder.system_prompt()
@@ -273,6 +201,18 @@ class WorldEngine:
                 identifier, title = parsed
                 parent_id = self._infer_parent_id(identifier)
                 parent_node = self._ensure_node(parent_id)
+                node = self.nodes.get(identifier)
+                if node:
+                    if node.title.startswith("Placeholder"):
+                        node.title = title
+                    elif node.title != title:
+                        node.title = title
+                        node.description = ""
+                    if node.parent is None or node.parent.identifier != parent_node.identifier:
+                        parent_node.add_child(node)
+                    current_node = node
+                    continue
+
                 node = WorldNode(identifier=identifier, title=title, parent=parent_node)
                 parent_node.add_child(node)
                 self.nodes[identifier] = node
@@ -292,6 +232,72 @@ class WorldEngine:
             return self.world_md_path.read_text(encoding="utf-8")
         return DEFAULT_WORLD_SPEC
 
+    def _build_micro_uniqueness_context(self, node: WorldNode) -> Optional[str]:
+        if not node.identifier.startswith("micro."):
+            return None
+        if not node.parent:
+            return None
+
+        parts = node.identifier.split(".")
+        label = None
+        if len(parts) == 2:
+            label = "已生成大地区"
+        elif len(parts) == 3 and parts[2].startswith("p"):
+            label = "已生成政权"
+        else:
+            return None
+
+        siblings = [
+            sibling
+            for sibling in node.parent.children.values()
+            if sibling.identifier != node.identifier and sibling.value
+        ]
+        if not siblings:
+            return None
+
+        lines = [f"{label}（避免重复）："]
+        for sibling in sorted(siblings, key=lambda item: item.identifier):
+            lines.append(f"- {sibling.identifier} {sibling.title}: {sibling.value}")
+        return "\n".join(lines)
+
+    def _seed_micro_structure(self) -> None:
+        if self.micro.children:
+            return
+
+        def add_if_missing(
+            parent_id: str, child_key: str, title: str, description: str = ""
+        ) -> WorldNode:
+            identifier = (
+                child_key if parent_id == "world" else f"{parent_id}.{child_key}"
+            )
+            if identifier in self.nodes:
+                return self.nodes[identifier]
+            return self.add_child(parent_id, child_key, title, description=description)
+
+        for index, region_title in enumerate(MICRO_REGIONS, start=1):
+            region_key = f"r{index}"
+            region_node = add_if_missing(
+                "micro",
+                region_key,
+                region_title,
+                description=MICRO_REGION_DESCRIPTION,
+            )
+            for polity_index in range(1, 3):
+                polity_key = f"p{polity_index}"
+                polity_node = add_if_missing(
+                    region_node.identifier,
+                    polity_key,
+                    f"政权{polity_index}",
+                    description=MICRO_POLITY_DESCRIPTION,
+                )
+                for aspect_key, aspect_title, aspect_desc in MICRO_POLITY_ASPECTS:
+                    add_if_missing(
+                        polity_node.identifier,
+                        aspect_key,
+                        aspect_title,
+                        description=aspect_desc,
+                    )
+
     def _log_llm_call(self, prompt: str, output: str) -> None:
         log_path = Path("log") / "llm.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -307,7 +313,10 @@ class WorldEngine:
             handle.write(entry)
 
     def _parse_line_as_node(self, line: str) -> Optional[tuple[str, str]]:
-        cn_match = re.match(r"^第([一二三四五六七八九十]+)维度[:：]?\s*(.*)$", line)
+        cn_match = re.match(
+            r"^[^0-9A-Za-z\u4e00-\u9fff]*第([一二三四五六七八九十]+)维度[:：]?\s*(.*)$",
+            line,
+        )
         if cn_match:
             number = self._chinese_numeral_to_int(cn_match.group(1))
             if number is not None:
@@ -323,7 +332,9 @@ class WorldEngine:
 
     def _infer_parent_id(self, identifier: str) -> str:
         if "." not in identifier:
-            return "world"
+            if identifier in {"world", "macro", "micro"}:
+                return "world"
+            return "macro"
         return identifier.rsplit(".", 1)[0]
 
     def _ensure_node(self, identifier: str) -> WorldNode:

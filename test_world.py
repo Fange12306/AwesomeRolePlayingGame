@@ -42,7 +42,7 @@ def run_demo() -> None:
     _save_snapshot(engine)
 
     print("\n示例节点输出：")
-    for node_id in ("1", "1.1", "1.1.1", "2.1"):
+    for node_id in ("1", "1.1", "1.2", "2.1"):
         node = engine.view_node(node_id)
         print(f"{node_id} - {node.title}: {node.value}")
 
@@ -80,21 +80,50 @@ def _write_mindmap(engine: WorldEngine) -> None:
 
 def _run_node_tests(engine: WorldEngine) -> None:
     print("\n节点操作测试：")
-    sample_node = engine.view_node("1.1.1")
+    sample_id = _choose_sample_node(engine)
+    sample_node = engine.view_node(sample_id)
     print(f"查看节点: {sample_node.identifier} - {sample_node.title}")
 
-    engine.update_node_content("1.1.1", "手动设定：核心法则由蒸汽科技驱动，能量必须付出代价。")
-    updated_node = engine.view_node("1.1.1")
+    engine.update_node_content(
+        sample_id, "手动设定：核心法则由蒸汽科技驱动，能量必须付出代价。"
+    )
+    updated_node = engine.view_node(sample_id)
     print(f"编辑节点内容: {updated_node.identifier} - {updated_node.value}")
 
+    new_key = "3"
+    new_identifier = f"2.{new_key}"
+    if new_identifier in engine.nodes:
+        new_key = "4"
+        new_identifier = f"2.{new_key}"
     new_node = engine.add_child(
-        "2", "3", "未来冲突", description="描述未来 50 年内的主要战争或变革。"
+        "2", new_key, "未来冲突", description="描述未来 50 年内的主要战争或变革。"
     )
     print(f"新增节点: {new_node.identifier} - {new_node.title}")
 
     children = engine.view_children("2")
     child_ids = [child.identifier for child in children]
     print(f"查看子节点(2): {child_ids}")
+
+
+def _choose_sample_node(engine: WorldEngine) -> str:
+    preferred = [
+        "1.1",
+        "1.2",
+        "2.1",
+        "3.1",
+    ]
+    for node_id in preferred:
+        if node_id in engine.nodes:
+            return node_id
+
+    candidates = [
+        node_id
+        for node_id, node in engine.nodes.items()
+        if node_id not in {"world", "macro", "micro"}
+    ]
+    if not candidates:
+        return "world"
+    return sorted(candidates)[0]
 
 
 def _save_snapshot(engine: WorldEngine) -> None:
