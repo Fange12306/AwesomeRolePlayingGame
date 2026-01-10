@@ -123,7 +123,7 @@ class WorldEngine:
                 continue
 
             parent_value = node.parent.value if node.parent else ""
-            extra_context = self._build_micro_uniqueness_context(node)
+            extra_context = self._build_micro_context(node)
             prompt = WorldPromptBuilder.build_node_prompt(
                 user_pitch=user_pitch,
                 node=node,
@@ -259,6 +259,37 @@ class WorldEngine:
         for sibling in sorted(siblings, key=lambda item: item.identifier):
             lines.append(f"- {sibling.identifier} {sibling.title}: {sibling.value}")
         return "\n".join(lines)
+
+    def _build_macro_context(self) -> Optional[str]:
+        if not self.macro.children:
+            return None
+
+        lines = ["Macro 内容（用于微观设定参考）："]
+
+        def dfs(node: WorldNode) -> None:
+            content = node.value or node.description
+            if content:
+                lines.append(f"- {node.identifier} {node.title}: {content}")
+            for child in sorted(node.children.values(), key=lambda item: item.identifier):
+                dfs(child)
+
+        dfs(self.macro)
+        return "\n".join(lines) if len(lines) > 1 else None
+
+    def _build_micro_context(self, node: WorldNode) -> Optional[str]:
+        if not node.identifier.startswith("micro."):
+            return None
+
+        parts: list[str] = []
+        macro_context = self._build_macro_context()
+        if macro_context:
+            parts.append(macro_context)
+
+        uniqueness_context = self._build_micro_uniqueness_context(node)
+        if uniqueness_context:
+            parts.append(uniqueness_context)
+
+        return "\n\n".join(parts) if parts else None
 
     def _seed_micro_structure(self) -> None:
         if self.micro.children:
