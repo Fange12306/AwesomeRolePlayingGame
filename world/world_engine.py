@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 from llm_api.llm_client import LLMClient
 from world.world_prompt import (
@@ -114,12 +114,23 @@ class WorldEngine:
         node = self._require_node(identifier)
         node.value = value
 
-    def generate_world(self, user_pitch: str, regenerate: bool = False) -> Dict[str, str]:
+    def generate_world(
+        self,
+        user_pitch: str,
+        regenerate: bool = False,
+        progress_callback: Optional[Callable[[WorldNode, int, int], None]] = None,
+    ) -> Dict[str, str]:
         self.root.value = user_pitch
         generated: Dict[str, str] = {}
-        for node in self._iter_nodes(skip_root=True):
+        nodes = self._iter_nodes(skip_root=True)
+        total = len(nodes)
+        completed = 0
+        for node in nodes:
             if node.value and not regenerate:
                 generated[node.identifier] = node.value
+                completed += 1
+                if progress_callback:
+                    progress_callback(node, completed, total)
                 continue
 
             parent_value = node.parent.value if node.parent else ""
@@ -135,6 +146,9 @@ class WorldEngine:
             )
             self._log_llm_call(prompt, node.value)
             generated[node.identifier] = node.value
+            completed += 1
+            if progress_callback:
+                progress_callback(node, completed, total)
 
         return generated
 

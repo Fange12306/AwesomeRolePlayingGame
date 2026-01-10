@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Awesome Role Playing Game</title>
+    <link rel="stylesheet" href="app.css" />
+    <link rel="stylesheet" href="world/world.css" />
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <header id="app-nav" class="top-nav is-hidden">
+      <div class="brand">
+        <span class="brand-mark">ARPG</span>
+        <span class="brand-name">World Studio</span>
+      </div>
+      <nav class="nav-links">
+        <button class="nav-btn active" data-page="home">主界面</button>
+        <button class="nav-btn" data-page="world">世界</button>
+        <button class="nav-btn" data-page="character">角色</button>
+        <button class="nav-btn" data-page="settings">设置</button>
+      </nav>
+    </header>
+
+    <main class="stage">
+      <section id="screen-landing" class="screen active">
+        <div class="card hero">
+          <h1>欢迎来到<br /><span>世界铸造台</span></h1>
+          <p>用一句话点燃新世界，让设定自动生长。</p>
+          <div class="actions">
+            <button id="btn-start" class="btn primary">开始</button>
+            <button id="btn-load" class="btn ghost" disabled>读取存档（预留）</button>
+            <button id="btn-settings" class="btn ghost" disabled>设置（预留）</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="screen-generator" class="screen">
+        <div class="card">
+          <div class="card-header">
+            <h2>世界生成</h2>
+            <span class="hint">输入一句话，生成完整世界结构。</span>
+          </div>
+          <label class="field">
+            <span>世界初稿</span>
+            <textarea id="world-prompt" rows="5" placeholder="例：一片漂浮于恒星风暴中的群岛文明，科技靠共振水晶驱动。"></textarea>
+          </label>
+          <div class="actions">
+            <button id="btn-generate" class="btn primary">生成世界</button>
+            <input id="world-file" type="file" accept="application/json" />
+            <button id="btn-import" class="btn ghost">读取本地 JSON</button>
+          </div>
+          <div class="progress-wrap">
+            <div class="progress">
+              <div id="progress-bar" class="progress-bar"></div>
+            </div>
+            <div id="progress-text" class="progress-text">等待指令</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="screen-character" class="screen">
+        <div class="card">
+          <div class="card-header">
+            <h2>角色设定（预留）</h2>
+            <span class="hint">后续在此添加角色创建流程。</span>
+          </div>
+          <div class="actions">
+            <button id="btn-skip-character" class="btn primary">跳过</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="screen-app" class="screen">
+        <div class="card app-shell">
+          <div class="app-page" data-page="home"></div>
+        <div class="app-page" data-page="world">
+          <div id="world-root" class="world-root"></div>
+        </div>
+          <div class="app-page" data-page="character">
+            <div class="placeholder">角色功能预留。</div>
+          </div>
+          <div class="app-page" data-page="settings">
+            <div class="placeholder">设置功能预留。</div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="world/world.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
