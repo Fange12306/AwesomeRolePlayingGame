@@ -8,10 +8,20 @@ from world.world_engine import WorldEngine
 
 
 def find_latest_snapshot() -> Path | None:
+    world_root = Path("save") / "world"
+    if world_root.exists():
+        snapshots = list(world_root.glob("*.json"))
+        if snapshots:
+            return max(snapshots, key=lambda item: item.stat().st_mtime)
+
     root = Path("save")
     if not root.exists():
         return None
-    snapshots = list(root.rglob("*.json"))
+    snapshots = [
+        path
+        for path in root.glob("*.json")
+        if path.name.startswith("world_")
+    ]
     if not snapshots:
         return None
     return max(snapshots, key=lambda item: item.stat().st_mtime)
