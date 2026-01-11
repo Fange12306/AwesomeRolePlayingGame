@@ -12,7 +12,9 @@ class DummyLLMClient:
     def __init__(self) -> None:
         self.calls = 0
 
-    def chat_once(self, prompt: str, system_prompt: str = "") -> str:
+    def chat_once(
+        self, prompt: str, system_prompt: str = "", log_label: str | None = None
+    ) -> str:
         self.calls += 1
         head = prompt.splitlines()[0][:60]
         return f"[dummy-{self.calls}] {head}..."

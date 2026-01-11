@@ -168,9 +168,10 @@ class CharacterEngine:
                 world_outline, blueprint, mount_point=mount_point
             )
             output = self.llm_client.chat_once(
-                prompt, system_prompt=CharacterPromptBuilder.system_prompt()
+                prompt,
+                system_prompt=CharacterPromptBuilder.system_prompt(),
+                log_label="CHARACTER",
             )
-            self._log_llm_call(prompt, output, label="CHARACTER")
             profile = self._parse_profile(output)
             record = CharacterRecord(
                 identifier=blueprint.identifier,
@@ -193,9 +194,10 @@ class CharacterEngine:
         character_lines = [self._summarize_character(record) for record in records]
         prompt = RelationPromptBuilder.build_prompt(character_lines)
         output = self.llm_client.chat_once(
-            prompt, system_prompt=RelationPromptBuilder.system_prompt()
+            prompt,
+            system_prompt=RelationPromptBuilder.system_prompt(),
+            log_label="RELATION",
         )
-        self._log_llm_call(prompt, output, label="RELATION")
         relations = self._parse_relations(output)
         self.relations = relations
         return relations
@@ -270,21 +272,6 @@ class CharacterEngine:
                     return output.strip()
         return output.strip()
 
-    def _log_llm_call(self, prompt: str, output: str, label: str) -> None:
-        log_path = Path("log") / "llm.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().isoformat(timespec="seconds")
-        entry = (
-            f"---{timestamp}---\n"
-            f"TYPE: {label}\n"
-            "PROMPT:\n"
-            f"{prompt}\n"
-            "OUTPUT:\n"
-            f"{output}\n"
-        )
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(entry)
-
     def generate_location_edges(
         self, records: Optional[List[CharacterRecord]] = None, regenerate: bool = False
     ) -> List[Dict[str, object]]:
@@ -306,9 +293,10 @@ class CharacterEngine:
             character_lines, location_lines, base_lines
         )
         output = self.llm_client.chat_once(
-            prompt, system_prompt=LocationRelationPromptBuilder.system_prompt()
+            prompt,
+            system_prompt=LocationRelationPromptBuilder.system_prompt(),
+            log_label="LOCATION_RELATION",
         )
-        self._log_llm_call(prompt, output, label="LOCATION_RELATION")
         extra_edges = self._parse_location_relations(output)
         merged = self._merge_location_edges(
             base_edges, extra_edges, location_lookup, {r.identifier for r in records}

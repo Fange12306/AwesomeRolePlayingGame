@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
@@ -142,9 +141,10 @@ class WorldEngine:
                 extra_context=extra_context,
             )
             node.value = self.llm_client.chat_once(
-                prompt, system_prompt=WorldPromptBuilder.system_prompt()
+                prompt,
+                system_prompt=WorldPromptBuilder.system_prompt(),
+                log_label="WORLD",
             )
-            self._log_llm_call(prompt, node.value)
             generated[node.identifier] = node.value
             completed += 1
             if progress_callback:
@@ -342,20 +342,6 @@ class WorldEngine:
                         aspect_title,
                         description=aspect_desc,
                     )
-
-    def _log_llm_call(self, prompt: str, output: str) -> None:
-        log_path = Path("log") / "llm.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().isoformat(timespec="seconds")
-        entry = (
-            f"---{timestamp}---\n"
-            "PROMPT：\n"
-            f"{prompt}\n"
-            "OUTPUT：\n"
-            f"{output}\n"
-        )
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(entry)
 
     def _parse_line_as_node(self, line: str) -> Optional[tuple[str, str]]:
         cn_match = re.match(
