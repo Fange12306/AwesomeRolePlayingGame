@@ -1,6 +1,7 @@
 const WorldView = (() => {
   const NODE_WIDTH = 240;
-  const NODE_HEIGHT = 120;
+  const COLLAPSED_HEIGHT = 64;
+  const EXPANDED_HEIGHT = 210;
   const H_GAP = 280;
   const V_GAP = 90;
   const PADDING = 80;
@@ -11,6 +12,7 @@ const WorldView = (() => {
   let elements = {};
   let snapshot = null;
   let collapsedNodes = new Set();
+  let openNodes = new Set();
   let collapseInitialized = false;
   let pendingSaves = new Map();
   let pan = { x: 0, y: 0 };
@@ -92,6 +94,7 @@ const WorldView = (() => {
       }
       snapshot = data.snapshot;
       collapsedNodes.clear();
+      openNodes.clear();
       collapseInitialized = false;
       pendingSaves.forEach((timer) => clearTimeout(timer));
       pendingSaves.clear();
@@ -163,18 +166,23 @@ const WorldView = (() => {
     node.children.forEach(applyCollapse);
   }
 
+  function assignHeights(node) {
+    node.height = openNodes.has(node.id) ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT;
+    node.children.forEach(assignHeights);
+  }
+
   function layoutTree(node, depth, yStart) {
     node.x = depth * H_GAP;
     if (!node.children.length) {
       node.y = yStart;
-      return NODE_HEIGHT;
+      return node.height;
     }
 
     let currentY = yStart;
     const childCenters = [];
     for (const child of node.children) {
       const childHeight = layoutTree(child, depth + 1, currentY);
-      childCenters.push(child.y + NODE_HEIGHT / 2);
+      childCenters.push(child.y + child.height / 2);
       currentY += childHeight + V_GAP;
     }
 
@@ -183,8 +191,8 @@ const WorldView = (() => {
       childCenters.length === 1
         ? childCenters[0]
         : (childCenters[0] + childCenters[childCenters.length - 1]) / 2;
-    node.y = centerY - NODE_HEIGHT / 2;
-    return Math.max(totalHeight, NODE_HEIGHT);
+    node.y = centerY - node.height / 2;
+    return Math.max(totalHeight, node.height);
   }
 
   function collect(node, nodes, links) {
@@ -210,6 +218,7 @@ const WorldView = (() => {
       collapseInitialized = true;
     }
     applyCollapse(root);
+    assignHeights(root);
     layoutTree(root, 0, 0);
 
     const nodes = [];
@@ -217,9 +226,9 @@ const WorldView = (() => {
     collect(root, nodes, links);
 
     const maxX = Math.max(...nodes.map((node) => node.x));
-    const maxY = Math.max(...nodes.map((node) => node.y));
+    const maxY = Math.max(...nodes.map((node) => node.y + node.height));
     const sceneWidth = maxX + NODE_WIDTH + PADDING * 2;
-    const sceneHeight = maxY + NODE_HEIGHT + PADDING * 2;
+    const sceneHeight = maxY + PADDING * 2;
     sceneSize = { width: sceneWidth, height: sceneHeight };
 
     elements.scene.style.width = `${sceneWidth}px`;
@@ -244,9 +253,9 @@ const WorldView = (() => {
 
     for (const link of links) {
       const startX = link.from.x + PADDING + NODE_WIDTH;
-      const startY = link.from.y + PADDING + NODE_HEIGHT / 2;
+      const startY = link.from.y + PADDING + link.from.height / 2;
       const endX = link.to.x + PADDING;
-      const endY = link.to.y + PADDING + NODE_HEIGHT / 2;
+      const endY = link.to.y + PADDING + link.to.height / 2;
       const midX = startX + (endX - startX) * 0.5;
       const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
       path.setAttribute(
@@ -272,7 +281,9 @@ const WorldView = (() => {
       card.className = "world-node";
       card.dataset.nodeId = node.id;
       card.dataset.depth = String(node.depth);
+      card.classList.toggle("is-open", openNodes.has(node.id));
       card.style.transform = `translate(${node.x + PADDING}px, ${node.y + PADDING}px)`;
+      card.style.minHeight = `${node.height}px`;
 
       const header = document.createElement("div");
       header.className = "node-head";
@@ -305,20 +316,35 @@ const WorldView = (() => {
       title.className = "node-title";
       title.textContent = node.title || node.id;
 
-      const meta = document.createElement("div");
-      meta.className = "node-meta";
-      meta.textContent = node.id;
-
       header.appendChild(toggle);
       header.appendChild(title);
-      header.appendChild(meta);
       card.appendChild(header);
+
+      header.addEventListener("click", () => {
+        const wasOpen = openNodes.has(node.id);
+        if (wasOpen) {
+          openNodes.delete(node.id);
+        } else {
+          openNodes.add(node.id);
+        }
+        render();
+        if (!wasOpen) {
+          fitToView();
+        }
+      });
+
+      const body = document.createElement("div");
+      body.className = "node-body";
+      const idLabel = document.createElement("div");
+      idLabel.className = "node-id";
+      idLabel.textContent = node.id;
+      body.appendChild(idLabel);
 
       if (node.description) {
         const desc = document.createElement("div");
         desc.className = "node-desc";
         desc.textContent = node.description;
-        card.appendChild(desc);
+        body.appendChild(desc);
       }
 
       const textarea = document.createElement("textarea");
@@ -326,7 +352,8 @@ const WorldView = (() => {
       textarea.addEventListener("input", () => {
         scheduleSave(node.id, textarea.value);
       });
-      card.appendChild(textarea);
+      body.appendChild(textarea);
+      card.appendChild(body);
 
       fragment.appendChild(card);
     }

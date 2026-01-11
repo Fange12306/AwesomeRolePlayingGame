@@ -116,8 +116,7 @@
 .world-node {
   position: absolute;
   width: 240px;
-  min-height: 120px;
-  padding: 14px 16px 16px;
+  padding: 12px 14px 14px;
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.92);
   border: 1px solid rgba(42, 38, 34, 0.15);
@@ -135,7 +134,7 @@
   align-items: center;
   gap: 10px;
   font-family: "Alegreya Sans", "Gill Sans", sans-serif;
-  margin-bottom: 8px;
+  cursor: pointer;
 }
 
 .node-toggle {
@@ -164,10 +163,19 @@
   color: var(--ink);
 }
 
-.node-meta {
-  margin-left: auto;
+.node-body {
+  display: none;
+  margin-top: 10px;
+}
+
+.world-node.is-open .node-body {
+  display: block;
+}
+
+.node-id {
   font-size: 0.75rem;
   color: var(--muted);
+  margin-bottom: 6px;
 }
 
 .node-desc {
@@ -179,7 +187,7 @@
 
 .world-node textarea {
   width: 100%;
-  min-height: 70px;
+  min-height: 90px;
   border-radius: 12px;
   border: 1px solid rgba(42, 38, 34, 0.15);
   background: rgba(255, 255, 255, 0.8);
