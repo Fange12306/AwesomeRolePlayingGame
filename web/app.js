@@ -15,15 +15,28 @@ const importBtn = document.getElementById("btn-import");
 const fileInput = document.getElementById("world-file");
 const progressBar = document.getElementById("progress-bar");
 const progressText = document.getElementById("progress-text");
+const skipWorldBtn = document.getElementById("btn-skip-world");
 const skipCharacterBtn = document.getElementById("btn-skip-character");
+const characterWorldSelect = document.getElementById("character-world");
+const characterTotalInput = document.getElementById("character-total");
+const characterPitchInput = document.getElementById("character-pitch");
+const characterGenerateBtn = document.getElementById("btn-character-generate");
+const characterRefreshBtn = document.getElementById("btn-character-refresh");
+const characterProgressBar = document.getElementById("character-progress-bar");
+const characterProgressText = document.getElementById("character-progress-text");
 
 let pollTimer = null;
+let characterPollTimer = null;
+let latestWorldSavePath = "";
 
 function showScreen(name) {
   Object.entries(screens).forEach(([key, node]) => {
     node.classList.toggle("active", key === name);
   });
   nav.classList.toggle("is-hidden", name !== "app");
+  if (name === "character") {
+    loadWorldSnapshots();
+  }
 }
 
 function showPage(name) {
@@ -36,6 +49,9 @@ function showPage(name) {
   if (name === "world" && window.WorldView) {
     window.WorldView.load();
   }
+  if (name === "character" && window.CharacterView) {
+    window.CharacterView.load();
+  }
 }
 
 function setProgress(completed, total) {
@@ -46,6 +62,22 @@ function setProgress(completed, total) {
 
 function setProgressMessage(message) {
   progressText.textContent = message;
+}
+
+function setCharacterProgress(completed, total) {
+  if (!characterProgressBar || !characterProgressText) {
+    return;
+  }
+  const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+  characterProgressBar.style.width = `${percent}%`;
+  characterProgressText.textContent = `进度 ${completed}/${total} (${percent}%)`;
+}
+
+function setCharacterMessage(message) {
+  if (!characterProgressText) {
+    return;
+  }
+  characterProgressText.textContent = message;
 }
 
 async function startGeneration() {
@@ -101,6 +133,9 @@ function pollProgress(jobId, total) {
         clearInterval(pollTimer);
         setProgress(data.total, data.total);
         setProgressMessage("生成完成，准备进入下一步。");
+        if (data.save_path) {
+          latestWorldSavePath = data.save_path;
+        }
         if (window.WorldView) {
           await window.WorldView.load();
         }
@@ -133,6 +168,7 @@ async function importSnapshot(file) {
     if (!data.ok) {
       throw new Error(data.error || "导入失败");
     }
+    latestWorldSavePath = data.save_path || "";
     if (window.WorldView) {
       await window.WorldView.load();
     }
@@ -143,6 +179,145 @@ async function importSnapshot(file) {
   }
 }
 
+async function loadWorldSnapshots() {
+  if (!characterWorldSelect) {
+    return;
+  }
+  characterWorldSelect.disabled = true;
+  characterWorldSelect.innerHTML = "";
+  if (characterGenerateBtn) {
+    characterGenerateBtn.disabled = true;
+  }
+  setCharacterMessage("正在读取世界存档...");
+  try {
+    const response = await fetch("/api/world/snapshots");
+    const data = await response.json();
+    if (!data.ok) {
+      throw new Error(data.error || "读取失败");
+    }
+    const snapshots = data.snapshots || [];
+    if (!snapshots.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "暂无世界存档";
+      characterWorldSelect.appendChild(option);
+      setCharacterMessage("暂无世界存档，请先生成世界。");
+      return;
+    }
+    const targetName = latestWorldSavePath
+      ? latestWorldSavePath.split("/").pop()
+      : "";
+    snapshots.forEach((snapshot, index) => {
+      const option = document.createElement("option");
+      option.value = snapshot.full_path || snapshot.path || "";
+      option.textContent = snapshot.name || snapshot.path || `存档 ${index + 1}`;
+      if (
+        latestWorldSavePath
+        && (option.value === latestWorldSavePath || snapshot.path === latestWorldSavePath)
+      ) {
+        option.selected = true;
+      } else if (targetName && snapshot.name === targetName) {
+        option.selected = true;
+      }
+      characterWorldSelect.appendChild(option);
+    });
+    characterWorldSelect.disabled = false;
+    if (characterGenerateBtn) {
+      characterGenerateBtn.disabled = false;
+    }
+    setCharacterMessage("请选择世界存档并开始生成角色。");
+  } catch (error) {
+    setCharacterMessage(`读取存档失败：${error.message}`);
+  }
+}
+
+async function startCharacterGeneration() {
+  if (!characterWorldSelect || !characterGenerateBtn) {
+    return;
+  }
+  const snapshot = characterWorldSelect.value;
+  const total = parseInt(characterTotalInput?.value || "0", 10);
+  const pitch = characterPitchInput?.value?.trim() || "";
+  if (!snapshot) {
+    setCharacterMessage("请先选择世界存档。");
+    return;
+  }
+  if (!total || total < 1) {
+    setCharacterMessage("角色数量需大于 0。");
+    return;
+  }
+  characterGenerateBtn.disabled = true;
+  if (characterRefreshBtn) {
+    characterRefreshBtn.disabled = true;
+  }
+  setCharacterProgress(0, total + 2);
+  setCharacterMessage("正在启动角色生成...");
+
+  try {
+    const response = await fetch("/api/characters/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ snapshot, total, pitch }),
+    });
+    const data = await response.json();
+    if (!data.ok) {
+      throw new Error(data.error || "生成失败");
+    }
+    pollCharacterProgress(data.job_id, data.total);
+  } catch (error) {
+    setCharacterMessage(`生成失败：${error.message}`);
+    characterGenerateBtn.disabled = false;
+    if (characterRefreshBtn) {
+      characterRefreshBtn.disabled = false;
+    }
+  }
+}
+
+function pollCharacterProgress(jobId, total) {
+  if (characterPollTimer) {
+    clearInterval(characterPollTimer);
+  }
+  setCharacterProgress(0, total || 1);
+  characterPollTimer = setInterval(async () => {
+    try {
+      const response = await fetch(`/api/progress?id=${jobId}`);
+      const data = await response.json();
+      if (!data.ok) {
+        throw new Error(data.error || "进度获取失败");
+      }
+      setCharacterProgress(data.completed, data.total || total || 1);
+      if (data.message) {
+        setCharacterMessage(data.message);
+      }
+      if (data.status === "error") {
+        clearInterval(characterPollTimer);
+        setCharacterMessage(`生成失败：${data.message}`);
+        characterGenerateBtn.disabled = false;
+        if (characterRefreshBtn) {
+          characterRefreshBtn.disabled = false;
+        }
+        return;
+      }
+      if (data.status === "done") {
+        clearInterval(characterPollTimer);
+        setCharacterProgress(data.total, data.total);
+        setCharacterMessage(data.message || "生成完成。");
+        characterGenerateBtn.disabled = false;
+        if (characterRefreshBtn) {
+          characterRefreshBtn.disabled = false;
+        }
+      }
+    } catch (error) {
+      clearInterval(characterPollTimer);
+      setCharacterMessage(`生成中断：${error.message}`);
+      characterGenerateBtn.disabled = false;
+      if (characterRefreshBtn) {
+        characterRefreshBtn.disabled = false;
+      }
+    }
+  }, 600);
+}
+
 navButtons.forEach((btn) => {
   btn.addEventListener("click", () => showPage(btn.dataset.page));
 });
@@ -150,6 +325,12 @@ navButtons.forEach((btn) => {
 document.getElementById("btn-start").addEventListener("click", () => {
   showScreen("generator");
 });
+
+if (skipWorldBtn) {
+  skipWorldBtn.addEventListener("click", () => {
+    showScreen("character");
+  });
+}
 
 generateBtn.addEventListener("click", startGeneration);
 
@@ -162,6 +343,14 @@ fileInput.addEventListener("change", (event) => {
   }
 });
 
+if (characterGenerateBtn) {
+  characterGenerateBtn.addEventListener("click", startCharacterGeneration);
+}
+
+if (characterRefreshBtn) {
+  characterRefreshBtn.addEventListener("click", loadWorldSnapshots);
+}
+
 skipCharacterBtn.addEventListener("click", () => {
   showScreen("app");
   showPage("home");
@@ -169,6 +358,10 @@ skipCharacterBtn.addEventListener("click", () => {
 
 if (window.WorldView) {
   window.WorldView.init({ rootId: "world-root" });
+}
+
+if (window.CharacterView) {
+  window.CharacterView.init({ rootId: "character-root" });
 }
 
 showScreen("landing");

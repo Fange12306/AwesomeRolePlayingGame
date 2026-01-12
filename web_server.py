@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
+from character.character_engine import CharacterEngine, CharacterRequest
 from world.world_engine import WorldEngine
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -72,6 +73,69 @@ def _normalize_snapshot(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return snapshot
 
 
+def _list_world_snapshots() -> list[Dict[str, Any]]:
+    snapshots: list[Dict[str, Any]] = []
+    folders = [SAVE_ROOT, SAVE_ROOT / "world"]
+    for folder in folders:
+        if not folder.exists():
+            continue
+        for path in folder.glob("*.json"):
+            try:
+                rel_path = path.relative_to(SAVE_ROOT)
+            except ValueError:
+                rel_path = path.name
+            snapshots.append(
+                {
+                    "name": path.name,
+                    "path": str(rel_path),
+                    "full_path": str(path),
+                    "mtime": path.stat().st_mtime,
+                }
+            )
+    snapshots.sort(key=lambda item: item.get("mtime", 0), reverse=True)
+    return snapshots
+
+
+def _list_character_snapshots() -> list[Dict[str, Any]]:
+    snapshots: list[Dict[str, Any]] = []
+    folders = [SAVE_ROOT / "characters", SAVE_ROOT]
+    for folder in folders:
+        if not folder.exists():
+            continue
+        for path in folder.glob("*.json"):
+            if folder == SAVE_ROOT and not path.name.startswith("characters_"):
+                continue
+            try:
+                rel_path = path.relative_to(SAVE_ROOT)
+            except ValueError:
+                rel_path = path.name
+            snapshots.append(
+                {
+                    "name": path.name,
+                    "path": str(rel_path),
+                    "full_path": str(path),
+                    "mtime": path.stat().st_mtime,
+                }
+            )
+    snapshots.sort(key=lambda item: item.get("mtime", 0), reverse=True)
+    return snapshots
+
+
+def _resolve_snapshot_path(snapshot_path: str) -> Optional[Path]:
+    if not snapshot_path:
+        return None
+    raw = Path(snapshot_path)
+    if raw.is_absolute():
+        candidate = raw.resolve()
+    else:
+        candidate = (SAVE_ROOT / raw).resolve()
+    try:
+        candidate.relative_to(SAVE_ROOT.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
 @dataclass
 class GenerationJob:
     job_id: str
@@ -126,6 +190,40 @@ class RequestHandler(SimpleHTTPRequestHandler):
                 return
             self._send_json({"ok": True, "snapshot": snapshot, "save_path": save_path})
             return
+        if parsed.path == "/api/world/snapshots":
+            snapshots = _list_world_snapshots()
+            self._send_json({"ok": True, "snapshots": snapshots})
+            return
+        if parsed.path == "/api/characters/snapshots":
+            snapshots = _list_character_snapshots()
+            self._send_json({"ok": True, "snapshots": snapshots})
+            return
+        if parsed.path == "/api/characters":
+            query = parse_qs(parsed.query)
+            snapshot_path = (query.get("path") or [""])[0]
+            if not snapshot_path:
+                self._send_json({"ok": False, "error": "missing_path"}, status=400)
+                return
+            resolved = _resolve_snapshot_path(snapshot_path)
+            if not resolved or not resolved.exists():
+                self._send_json({"ok": False, "error": "snapshot_not_found"}, status=404)
+                return
+            try:
+                payload = json.loads(resolved.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                self._send_json(
+                    {"ok": False, "error": f"invalid_snapshot: {exc}"},
+                    status=400,
+                )
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "snapshot": payload,
+                    "path": str(resolved.relative_to(SAVE_ROOT)),
+                }
+            )
+            return
 
         if parsed.path == "/api/progress":
             query = parse_qs(parsed.query)
@@ -170,6 +268,9 @@ class RequestHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/update":
             self._handle_update(payload)
             return
+        if parsed.path == "/api/characters/generate":
+            self._handle_character_generate(payload)
+            return
 
         self.send_error(404, "Not found")
 
@@ -208,6 +309,76 @@ class RequestHandler(SimpleHTTPRequestHandler):
                     job.save_path = str(save_path)
                     STATE.snapshot = snapshot
                     STATE.current_save = save_path
+            except Exception as exc:
+                with STATE.lock:
+                    job.status = "error"
+                    job.message = str(exc)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        self._send_json({"ok": True, "job_id": job_id, "total": job.total})
+
+    def _handle_character_generate(self, payload: Dict[str, Any]) -> None:
+        snapshot_raw = str(payload.get("snapshot", "")).strip()
+        total_raw = payload.get("total")
+        pitch = str(payload.get("pitch", "")).strip()
+        if not snapshot_raw:
+            self._send_json({"ok": False, "error": "missing_snapshot"}, status=400)
+            return
+        try:
+            total = int(total_raw)
+        except (TypeError, ValueError):
+            self._send_json({"ok": False, "error": "invalid_total"}, status=400)
+            return
+        if total <= 0:
+            self._send_json({"ok": False, "error": "invalid_total"}, status=400)
+            return
+
+        snapshot_path = _resolve_snapshot_path(snapshot_raw)
+        if not snapshot_path or not snapshot_path.exists():
+            self._send_json({"ok": False, "error": "snapshot_not_found"}, status=404)
+            return
+
+        job_id = uuid.uuid4().hex
+        job = GenerationJob(
+            job_id=job_id, total=total + 2, message="准备生成角色"
+        )
+        with STATE.lock:
+            STATE.jobs[job_id] = job
+
+        def progress_cb(completed: int, total_chars: int) -> None:
+            with STATE.lock:
+                job.completed = completed
+                job.total = total_chars + 2
+                job.message = f"角色生成 {completed}/{total_chars}"
+
+        def worker() -> None:
+            try:
+                engine = CharacterEngine.from_world_snapshot(snapshot_path)
+                request = CharacterRequest(total=total, pitch=pitch)
+                records = engine.generate_characters(
+                    request, progress_callback=progress_cb
+                )
+                with STATE.lock:
+                    job.completed = max(job.completed, total)
+                    job.message = "角色生成完成，生成关系..."
+
+                relations = engine.generate_relations(records)
+                with STATE.lock:
+                    job.completed = total + 1
+                    job.message = "角色关系生成完成，生成地点关系..."
+
+                location_edges = engine.generate_location_edges(records)
+                save_path = SAVE_ROOT / "characters" / f"characters_{_timestamp()}.json"
+                engine.save_snapshot(save_path, records)
+                with STATE.lock:
+                    job.status = "done"
+                    job.completed = total + 2
+                    job.save_path = str(save_path)
+                    job.message = (
+                        f"完成：角色 {len(records)} / 关系 {len(relations)} "
+                        f"/ 地点关系 {len(location_edges)}"
+                    )
             except Exception as exc:
                 with STATE.lock:
                     job.status = "error"

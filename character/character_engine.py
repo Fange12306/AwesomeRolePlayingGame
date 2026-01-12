@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from itertools import cycle
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 from llm_api.llm_client import LLMClient
 from character.character_prompt import (
@@ -18,6 +18,7 @@ from character.character_prompt import (
 @dataclass
 class CharacterRequest:
     total: int
+    pitch: str = ""
 
 
 @dataclass
@@ -148,9 +149,15 @@ class CharacterEngine:
         return blueprints
 
     def generate_characters(
-        self, request: CharacterRequest, regenerate: bool = False
+        self,
+        request: CharacterRequest,
+        regenerate: bool = False,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        max_retries: int = 1,
     ) -> List[CharacterRecord]:
         if self.records and not regenerate:
+            if progress_callback:
+                progress_callback(len(self.records), len(self.records))
             return self.records
 
         mount_points = self.extract_mount_points()
@@ -161,18 +168,20 @@ class CharacterEngine:
         blueprints = self.build_blueprints(request, mount_points)
 
         records: List[CharacterRecord] = []
+        total = len(blueprints)
+        completed = 0
         for blueprint in blueprints:
             mount_key = (blueprint.region_id, blueprint.polity_id)
             mount_point = mount_lookup.get(mount_key)
             prompt = CharacterPromptBuilder.build_prompt(
-                world_outline, blueprint, mount_point=mount_point
+                world_outline,
+                blueprint,
+                mount_point=mount_point,
+                character_pitch=request.pitch,
             )
-            output = self.llm_client.chat_once(
-                prompt,
-                system_prompt=CharacterPromptBuilder.system_prompt(),
-                log_label="CHARACTER",
+            profile = self._generate_profile_with_retry(
+                prompt, max_retries=max_retries
             )
-            profile = self._parse_profile(output)
             record = CharacterRecord(
                 identifier=blueprint.identifier,
                 region_id=blueprint.region_id,
@@ -180,6 +189,9 @@ class CharacterEngine:
                 profile=profile,
             )
             records.append(record)
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total)
 
         self.records = records
         return records
@@ -271,6 +283,34 @@ class CharacterEngine:
                 except json.JSONDecodeError:
                     return output.strip()
         return output.strip()
+
+    def _generate_profile_with_retry(
+        self, prompt: str, max_retries: int = 1
+    ) -> Dict[str, object] | str:
+        system_prompt = CharacterPromptBuilder.system_prompt()
+        output = self.llm_client.chat_once(
+            prompt,
+            system_prompt=system_prompt,
+            log_label="CHARACTER",
+        )
+        profile = self._parse_profile(output)
+        if isinstance(profile, dict):
+            return profile
+        for attempt in range(max_retries):
+            retry_prompt = (
+                f"{prompt}\n\n"
+                "上次输出格式不符合要求，请重新生成。\n"
+                "要求：只输出单个 JSON 对象，禁止数组或多角色，且不要 Markdown。"
+            )
+            output = self.llm_client.chat_once(
+                retry_prompt,
+                system_prompt=system_prompt,
+                log_label=f"CHARACTER_RETRY_{attempt + 1}",
+            )
+            profile = self._parse_profile(output)
+            if isinstance(profile, dict):
+                return profile
+        return profile
 
     def generate_location_edges(
         self, records: Optional[List[CharacterRecord]] = None, regenerate: bool = False

@@ -98,6 +98,7 @@ class CharacterPromptBuilder:
         world_outline: str,
         blueprint: "CharacterBlueprint",
         mount_point: Optional["MountPoint"] = None,
+        character_pitch: str = "",
     ) -> str:
         location_lines = []
         if mount_point:
@@ -115,9 +116,15 @@ class CharacterPromptBuilder:
                 location_lines.append(f"  政体说明: {mount_point.polity_value}")
         location_text = "\n".join(location_lines) if location_lines else "无"
 
+        pitch_text = character_pitch.strip()
+        pitch_block = (
+            f"角色总概况（用户提供）:\n{pitch_text}\n\n" if pitch_text else "角色总概况（用户提供）:\n无\n\n"
+        )
+
         return (
             "世界纲要（供约束与风格参考）:\n"
             f"{world_outline}\n\n"
+            f"{pitch_block}"
             "角色挂载位置（region/polity）:\n"
             f"{location_text}\n\n"
             "角色标识:\n"
@@ -127,12 +134,14 @@ class CharacterPromptBuilder:
             "生成要求:\n"
             "1) 与世界设定与挂载位置保持一致，不要违背已知信息。\n"
             "2) 覆盖上述维度，内容具体但简短。\n"
-            "3) 仅输出严格 JSON，不要 Markdown 或多余文本。\n"
-            "4) JSON 字段固定为: name, summary, background, motivation, conflict, "
+            "3) 只输出单个 JSON 对象，禁止数组或多角色。\n"
+            "4) 仅输出严格 JSON，不要 Markdown 或多余文本。\n"
+            "5) JSON 字段固定为: name, summary, background, motivation, conflict, "
             "abilities, weaknesses, relationships, hooks, faction, profession, species, tier。\n"
-            "5) tier 表示主次层级（如 main/support/extra），请合理填写。\n"
-            "6) relationships 仅描述关系倾向/社交方式，不要写具体角色ID。\n"
-            "7) 具体关系边表由后续流程生成，此处不输出 relations。\n"
+            "6) tier 表示主次层级（如 main/support/extra），请合理填写。\n"
+            "7) relationships 仅描述关系倾向/社交方式，不要写具体角色ID。\n"
+            "8) 具体关系边表由后续流程生成，此处不输出 relations。\n"
+            "9) 角色总体风格应符合角色总概况（如有）。\n"
         )
 
 

@@ -35,9 +35,11 @@ def run_demo() -> None:
         return
 
     total = _prompt_int("Total characters", default=6, minimum=1)
+    pitch = input("Character overview (optional, one sentence): ").strip()
 
     request = CharacterRequest(
         total=total,
+        pitch=pitch,
     )
 
     client = choose_llm_client()
