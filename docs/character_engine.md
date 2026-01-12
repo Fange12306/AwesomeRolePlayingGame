@@ -7,7 +7,7 @@ Character generation utilities backed by `character/character_engine.py` and
 - 数据来源：读取世界快照（`WorldEngine.as_dict()` 或 `save/world/*.json`），抽取 `micro` 子树作为区域/政体挂载点。
 - 角色结果：角色主体存放在 `profile`（JSON），顶层仅保留 `id/region_id/polity_id` 便于定位与映射。
 - 关系拆分：角色关系与角色-地点关系采用独立边表（`relations` / `character_location_edges`）。
-- 日志记录：角色、关系、地点边表的 LLM 调用统一写入 `log/llm.log`（带 `TYPE` 标记）。
+- 日志记录：LLM 调用日志由 `LLMClient` 统一写入 `log/llm.log`（带 `TYPE` 标记）。
 
 ## 主要 API（CharacterEngine）
 - `from_world_snapshot(path, llm_client=None)`：从世界快照文件初始化。
@@ -21,7 +21,7 @@ Character generation utilities backed by `character/character_engine.py` and
 
 ## LLM 生成流程
 1) 读取世界快照并提取 `micro` 区域/政体节点。  
-2) 生成角色（`CharacterPromptBuilder`）并输出 JSON `profile`。  
+2) 使用角色总概况（可选）生成角色（`CharacterPromptBuilder`）并输出 JSON `profile`。  
 3) 基于角色摘要生成关系边表（`RelationPromptBuilder`）。  
 4) 基于角色 + 地点列表生成角色-地点边表（`LocationRelationPromptBuilder`）。  
 5) 保存快照，包含 `characters/relations/character_location_edges`。
@@ -36,7 +36,7 @@ Character generation utilities backed by `character/character_engine.py` and
 from character.character_engine import CharacterEngine, CharacterRequest
 
 engine = CharacterEngine.from_world_snapshot("save/world/world_20240101_120000.json")
-request = CharacterRequest(total=6)
+request = CharacterRequest(total=6, pitch="一句话角色总概况")
 
 records = engine.generate_characters(request)
 relations = engine.generate_relations(records)
@@ -79,4 +79,4 @@ engine.save_snapshot("save/characters/characters_20240101_120000.json")
 
 ## 环境配置
 - 依赖 `.env` 或系统变量：`OPENAI_API_KEY`（必需）、`OPENAI_BASE_URL`（可选）、`OPENAI_MODEL`（可选，默认 `gpt-3.5-turbo`）。
-- `test_character.py` 提供交互式流程：选择世界快照并输入角色数量。
+- `test_character.py` 提供交互式流程：选择世界快照、输入角色数量与角色总概况。

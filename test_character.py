@@ -12,7 +12,9 @@ class DummyLLMClient:
     def __init__(self) -> None:
         self.calls = 0
 
-    def chat_once(self, prompt: str, system_prompt: str = "") -> str:
+    def chat_once(
+        self, prompt: str, system_prompt: str = "", log_label: str | None = None
+    ) -> str:
         self.calls += 1
         head = prompt.splitlines()[0][:60]
         return f"[dummy-{self.calls}] {head}..."
@@ -33,9 +35,11 @@ def run_demo() -> None:
         return
 
     total = _prompt_int("Total characters", default=6, minimum=1)
+    pitch = input("Character overview (optional, one sentence): ").strip()
 
     request = CharacterRequest(
         total=total,
+        pitch=pitch,
     )
 
     client = choose_llm_client()

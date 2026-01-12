@@ -209,6 +209,18 @@ textarea {
   background: rgba(255, 255, 255, 0.8);
 }
 
+.field input,
+.field select {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  font-size: 1rem;
+  font-family: "Alegreya Sans", "Gill Sans", sans-serif;
+  border-radius: 14px;
+  border: 1px solid rgba(42, 38, 34, 0.18);
+  background: rgba(255, 255, 255, 0.8);
+}
+
 #world-file {
   display: none;
 }

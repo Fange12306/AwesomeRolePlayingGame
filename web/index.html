@@ -6,6 +6,7 @@
     <title>Awesome Role Playing Game</title>
     <link rel="stylesheet" href="app.css" />
     <link rel="stylesheet" href="world/world.css" />
+    <link rel="stylesheet" href="character/character.css" />
   </head>
   <body>
     <div class="backdrop"></div>
@@ -29,6 +30,7 @@
           <p>用一句话点燃新世界，让设定自动生长。</p>
           <div class="actions">
             <button id="btn-start" class="btn primary">开始</button>
+            <button id="btn-skip-world" class="btn ghost">直接生成角色</button>
             <button id="btn-load" class="btn ghost" disabled>读取存档（预留）</button>
             <button id="btn-settings" class="btn ghost" disabled>设置（预留）</button>
           </div>
@@ -62,11 +64,35 @@
       <section id="screen-character" class="screen">
         <div class="card">
           <div class="card-header">
-            <h2>角色设定（预留）</h2>
-            <span class="hint">后续在此添加角色创建流程。</span>
+            <h2>角色生成</h2>
+            <span class="hint">选择世界存档，生成角色与关系网络。</span>
           </div>
+          <label class="field">
+            <span>世界存档</span>
+            <select id="character-world"></select>
+          </label>
+          <label class="field">
+            <span>角色数量</span>
+            <input id="character-total" type="number" min="1" value="6" />
+          </label>
+          <label class="field">
+            <span>角色总概况（可选）</span>
+            <textarea
+              id="character-pitch"
+              rows="3"
+              placeholder="例：极地裂隙的游牧者与贵族间的隐秘斗争。"
+            ></textarea>
+          </label>
           <div class="actions">
-            <button id="btn-skip-character" class="btn primary">跳过</button>
+            <button id="btn-character-generate" class="btn primary">生成角色</button>
+            <button id="btn-character-refresh" class="btn ghost">刷新存档</button>
+            <button id="btn-skip-character" class="btn ghost">跳过</button>
+          </div>
+          <div class="progress-wrap">
+            <div class="progress">
+              <div id="character-progress-bar" class="progress-bar"></div>
+            </div>
+            <div id="character-progress-text" class="progress-text">等待指令</div>
           </div>
         </div>
       </section>
@@ -77,9 +103,9 @@
         <div class="app-page" data-page="world">
           <div id="world-root" class="world-root"></div>
         </div>
-          <div class="app-page" data-page="character">
-            <div class="placeholder">角色功能预留。</div>
-          </div>
+        <div class="app-page" data-page="character">
+            <div id="character-root" class="character-root"></div>
+        </div>
           <div class="app-page" data-page="settings">
             <div class="placeholder">设置功能预留。</div>
           </div>
@@ -88,6 +114,7 @@
     </main>
 
     <script src="world/world.js"></script>
+    <script src="character/character.js"></script>
     <script src="app.js"></script>
   </body>
 </html>
