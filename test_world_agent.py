@@ -44,13 +44,13 @@ def run_demo() -> None:
     print(extract)
 
     print("\n[判断操作 + 新增节点]")
-    decision_add = agent.decide_action("剧情信息：新增一个关于未来走向的节点，标题：未来走向。")
+    decision_add = agent.decide_action("剧情信息：新增一个关于未来走向的节点，名称：未来走向。")
     new_node = agent.apply_update(
         decision_add.flag,
         decision_add.index,
         "剧情信息：世界经历能源枯竭，社会开始分裂并形成新的迁徙潮。",
     )
-    print(f"新增节点：{new_node.identifier} {new_node.title} -> {new_node.value}")
+    print(f"新增节点：{new_node.identifier} {new_node.key} -> {new_node.value}")
 
     print("\n[判断操作 + 修改节点]")
     decision_update = agent.decide_action("剧情信息：补充核心设定的细节")
@@ -59,7 +59,7 @@ def run_demo() -> None:
         decision_update.index,
         "剧情信息：核心力量会消耗持有者寿命，且必须以特定仪式启动。",
     )
-    print(f"修改节点：{updated_node.identifier} {updated_node.title} -> {updated_node.value}")
+    print(f"修改节点：{updated_node.identifier} {updated_node.key} -> {updated_node.value}")
 
 
 if __name__ == "__main__":

@@ -24,10 +24,10 @@ class CharacterRequest:
 @dataclass
 class MountPoint:
     region_id: Optional[str]
-    region_title: str = ""
+    region_key: str = ""
     region_value: str = ""
     polity_id: Optional[str] = None
-    polity_title: str = ""
+    polity_key: str = ""
     polity_value: str = ""
 
 
@@ -90,7 +90,7 @@ class CharacterEngine:
         ]
         for region_id in region_ids:
             region_node = self.world_snapshot.get(region_id, {})
-            region_title = str(region_node.get("title", ""))
+            region_key = str(region_node.get("key", region_node.get("title", "")))
             region_value = str(region_node.get("value", ""))
             polity_ids = [
                 child_id
@@ -102,7 +102,7 @@ class CharacterEngine:
                 mount_points.append(
                     MountPoint(
                         region_id=region_id,
-                        region_title=region_title,
+                        region_key=region_key,
                         region_value=region_value,
                     )
                 )
@@ -113,10 +113,10 @@ class CharacterEngine:
                 mount_points.append(
                     MountPoint(
                         region_id=region_id,
-                        region_title=region_title,
+                        region_key=region_key,
                         region_value=region_value,
                         polity_id=polity_id,
-                        polity_title=str(polity_node.get("title", "")),
+                        polity_key=str(polity_node.get("key", polity_node.get("title", ""))),
                         polity_value=str(polity_node.get("value", "")),
                     )
                 )
@@ -256,7 +256,7 @@ class CharacterEngine:
         macro_children = macro_node.get("children", []) if macro_node else []
         for child_id in macro_children:
             child = self.world_snapshot.get(child_id, {})
-            title = str(child.get("title", "")).strip()
+            title = str(child.get("key", child.get("title", ""))).strip()
             value = str(child.get("value", "")).strip()
             if not (title or value):
                 continue
@@ -364,7 +364,7 @@ class CharacterEngine:
                 locations.append(
                     {
                         "id": node_id,
-                        "title": str(node.get("title", "")),
+                        "title": str(node.get("key", node.get("title", ""))),
                         "value": str(node.get("value", "")),
                         "location_type": location_type,
                     }
@@ -402,6 +402,7 @@ class CharacterEngine:
             "resources",
             "geography",
             "population",
+            "technology",
         }
 
     def _build_rule_location_edges(

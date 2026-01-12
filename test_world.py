@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -5,17 +8,26 @@ from world.world_engine import WorldEngine
 
 
 class DummyLLMClient:
-    """Lightweight stub that echoes prompts for offline testing."""
+    """Lightweight stub for offline testing of world generation."""
 
     def __init__(self) -> None:
-        self.calls = 0
+        self.calls = []
+        self.region_attempts = 0
 
     def chat_once(
         self, prompt: str, system_prompt: str = "", log_label: str | None = None
     ) -> str:
-        self.calls += 1
+        self.calls.append(log_label or "")
+        if log_label and log_label.startswith("MACRO_"):
+            return f"{log_label} 设定内容"
+        if log_label == "MICRO_REGIONS":
+            return json.dumps(["霜谷", "雾岭"], ensure_ascii=False)
+        if log_label and log_label.startswith("MICRO_POLITIES_"):
+            return json.dumps(["北境议会", "林雾教团"], ensure_ascii=False)
+        if log_label and log_label.startswith("MICRO_VALUE_"):
+            return f"{log_label} 设定内容"
         head = prompt.splitlines()[0][:60]
-        return f"[dummy-{self.calls}] {head}..."
+        return f"[dummy] {head}"
 
 
 def choose_llm_client():
@@ -37,16 +49,21 @@ def run_demo() -> None:
         print(f"未输入，使用默认设定：{pitch}")
 
     client = choose_llm_client()
-    engine = WorldEngine(world_md_path=None, llm_client=client)
-    engine.generate_world(pitch)
+    engine = WorldEngine(
+        llm_client=client,
+        user_pitch=pitch,
+        auto_generate=True,
+    )
     _run_node_tests(engine)
     _write_mindmap(engine)
     _save_snapshot(engine)
 
     print("\n示例节点输出：")
     for node_id in ("1", "1.1", "1.2", "2.1"):
+        if node_id not in engine.nodes:
+            continue
         node = engine.view_node(node_id)
-        print(f"{node_id} - {node.title}: {node.value}")
+        print(f"{node_id} - {node.key}: {node.value}")
 
 
 def _write_mindmap(engine: WorldEngine) -> None:
@@ -57,7 +74,7 @@ def _write_mindmap(engine: WorldEngine) -> None:
 
     def walk(node, depth: int) -> None:
         indent = "  " * depth
-        label = f"{node.identifier} {node.title}"
+        label = f"{node.identifier} {node.key}".strip()
         lines.append(f"{indent}{label}")
 
         if node.value:
@@ -84,7 +101,7 @@ def _run_node_tests(engine: WorldEngine) -> None:
     print("\n节点操作测试：")
     sample_id = _choose_sample_node(engine)
     sample_node = engine.view_node(sample_id)
-    print(f"查看节点: {sample_node.identifier} - {sample_node.title}")
+    print(f"查看节点: {sample_node.identifier} - {sample_node.key}")
 
     engine.update_node_content(
         sample_id, "手动设定：核心法则由蒸汽科技驱动，能量必须付出代价。"
@@ -92,15 +109,13 @@ def _run_node_tests(engine: WorldEngine) -> None:
     updated_node = engine.view_node(sample_id)
     print(f"编辑节点内容: {updated_node.identifier} - {updated_node.value}")
 
-    new_key = "3"
+    new_key = "4"
     new_identifier = f"2.{new_key}"
     if new_identifier in engine.nodes:
-        new_key = "4"
+        new_key = "5"
         new_identifier = f"2.{new_key}"
-    new_node = engine.add_child(
-        "2", new_key, "未来冲突", description="描述未来 50 年内的主要战争或变革。"
-    )
-    print(f"新增节点: {new_node.identifier} - {new_node.title}")
+    new_node = engine.add_child("2", new_key, "未来冲突")
+    print(f"新增节点: {new_node.identifier} - {new_node.key}")
 
     children = engine.view_children("2")
     child_ids = [child.identifier for child in children]
@@ -120,7 +135,7 @@ def _choose_sample_node(engine: WorldEngine) -> str:
 
     candidates = [
         node_id
-        for node_id, node in engine.nodes.items()
+        for node_id in engine.nodes
         if node_id not in {"world", "macro", "micro"}
     ]
     if not candidates:

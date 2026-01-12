@@ -16,7 +16,7 @@ from world.world_engine import WorldEngine
 BASE_DIR = Path(__file__).resolve().parent
 WEB_ROOT = BASE_DIR / "web"
 SAVE_ROOT = BASE_DIR / "save"
-WORLD_MD = BASE_DIR / "world.md"
+WORLD_SPEC = BASE_DIR / "world" / "world_spec.md"
 
 
 def _timestamp() -> str:
@@ -42,8 +42,7 @@ def _normalize_snapshot(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         if not isinstance(node, dict):
             continue
         snapshot[identifier] = {
-            "title": node.get("title", identifier),
-            "description": node.get("description", ""),
+            "key": node.get("key", node.get("title", identifier)),
             "value": node.get("value", ""),
             "children": node.get("children", []),
         }
@@ -280,15 +279,8 @@ class RequestHandler(SimpleHTTPRequestHandler):
             self._send_json({"ok": False, "error": "missing_prompt"}, status=400)
             return
 
-        try:
-            engine = WorldEngine(world_md_path=str(WORLD_MD))
-        except Exception as exc:
-            self._send_json({"ok": False, "error": str(exc)}, status=500)
-            return
-
-        nodes = engine._iter_nodes(skip_root=True)
         job_id = uuid.uuid4().hex
-        job = GenerationJob(job_id=job_id, total=len(nodes))
+        job = GenerationJob(job_id=job_id, total=0)
         with STATE.lock:
             STATE.jobs[job_id] = job
 
@@ -299,7 +291,12 @@ class RequestHandler(SimpleHTTPRequestHandler):
 
         def worker() -> None:
             try:
-                engine.generate_world(prompt, progress_callback=progress_cb)
+                engine = WorldEngine(
+                    world_spec_path=str(WORLD_SPEC),
+                    user_pitch=prompt,
+                    auto_generate=True,
+                    progress_callback=progress_cb,
+                )
                 save_path = SAVE_ROOT / f"world_{_timestamp()}.json"
                 engine.save_snapshot(save_path)
                 snapshot = engine.as_dict()

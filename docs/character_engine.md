@@ -4,7 +4,7 @@ Character generation utilities backed by `character/character_engine.py` and
 `character/character_prompt.py`.
 
 ## 核心设计
-- 数据来源：读取世界快照（`WorldEngine.as_dict()` 或 `save/world/*.json`），抽取 `micro` 子树作为区域/政体挂载点。
+- 数据来源：读取世界快照（`WorldEngine.as_dict()` 或 `save/world/*.json`），快照节点为 `key/value` 结构，抽取 `micro` 子树作为区域/政体挂载点。
 - 角色结果：角色主体存放在 `profile`（JSON），顶层仅保留 `id/region_id/polity_id` 便于定位与映射。
 - 关系拆分：角色关系与角色-地点关系采用独立边表（`relations` / `character_location_edges`）。
 - 日志记录：LLM 调用日志由 `LLMClient` 统一写入 `log/llm.log`（带 `TYPE` 标记）。

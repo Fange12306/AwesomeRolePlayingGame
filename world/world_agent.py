@@ -56,10 +56,10 @@ class WorldAgent:
             "世界节点：",
         ]
         for node in self._iter_nodes():
-            content = (node.value or node.description).strip()
+            content = (node.value or "").strip()
             if not content:
                 continue
-            lines.append(f"- {node.identifier} {node.title}: {content}")
+            lines.append(f"- {node.identifier} {node.key}: {content}")
         return "\n".join(lines)
 
     def _build_decision_prompt(self, update_info: str) -> str:
@@ -74,34 +74,34 @@ class WorldAgent:
             "可用节点：",
         ]
         for node in self._iter_nodes():
-            lines.append(f"- {node.identifier} {node.title}")
+            lines.append(f"- {node.identifier} {node.key}")
         return "\n".join(lines)
 
     def _build_update_prompt(self, node: WorldNode, update_info: str) -> str:
-        original = (node.value or node.description or "").strip()
+        original = (node.value or "").strip() or "无"
         return "\n".join(
             [
                 "【任务】更新节点内容",
                 "只输出更新后的节点内容，不要解释。",
-                f"节点：{node.identifier} {node.title}",
+                f"节点：{node.identifier} {node.key}",
                 f"剧情信息：{update_info.strip()}",
-                f"原节点内容：{original or '无'}",
+                f"原节点内容：{original}",
             ]
         )
 
     def _build_add_prompt(self, parent: WorldNode, update_info: str) -> str:
-        parent_content = (parent.value or parent.description or "").strip()
-        siblings = [child.title for child in parent.children.values()]
+        parent_content = (parent.value or "").strip() or "无"
+        siblings = [child.key for child in parent.children.values()]
         sibling_text = "、".join(siblings) if siblings else "无"
         return "\n".join(
             [
                 "【任务】新增子节点内容",
                 "只输出两行，格式如下：",
-                "<|TITLE|>:新节点标题",
-                "<|CONTENT|>:新节点内容",
-                f"父节点：{parent.identifier} {parent.title}",
-                f"父节点内容：{parent_content or '无'}",
-                f"已有子节点标题：{sibling_text}",
+                "<|KEY|>:新节点名称",
+                "<|VALUE|>:新节点内容",
+                f"父节点：{parent.identifier} {parent.key}",
+                f"父节点内容：{parent_content}",
+                f"已有子节点名称：{sibling_text}",
                 f"剧情信息：{update_info.strip()}",
             ]
         )
@@ -119,9 +119,9 @@ class WorldAgent:
         parent = self.engine.view_node(index)
         prompt = self._build_add_prompt(parent, update_info)
         response = self.llm_client.chat_once(prompt, system_prompt=self._system_prompt())
-        title, content = self._parse_title_and_content(response, update_info)
+        key, content = self._parse_key_and_value(response, update_info)
         child_key = self._choose_child_key(parent)
-        node = self.engine.add_child(parent.identifier, child_key, title)
+        node = self.engine.add_child(parent.identifier, child_key, key)
         node.value = content
         return node
 
@@ -158,18 +158,18 @@ class WorldAgent:
 
         raise ValueError(f"Unable to parse decision from response: {response}")
 
-    def _parse_title_and_content(
+    def _parse_key_and_value(
         self, response: str, update_info: str
     ) -> tuple[str, str]:
-        title = None
+        key = None
         content_lines: list[str] = []
         capture_content = False
         for line in response.splitlines():
-            title_match = re.match(r"<\|TITLE\|>\s*[:：]?\s*(.*)", line)
-            if title_match and title is None:
-                title = title_match.group(1).strip()
+            key_match = re.match(r"<\|KEY\|>\s*[:：]?\s*(.*)", line)
+            if key_match and key is None:
+                key = key_match.group(1).strip()
                 continue
-            content_match = re.match(r"<\|CONTENT\|>\s*[:：]?\s*(.*)", line)
+            content_match = re.match(r"<\|VALUE\|>\s*[:：]?\s*(.*)", line)
             if content_match:
                 capture_content = True
                 content_lines.append(content_match.group(1).strip())
@@ -181,14 +181,16 @@ class WorldAgent:
         if not content:
             content = response.strip()
 
-        if not title:
-            title = self._infer_title(update_info) or "新节点"
+        if not key:
+            key = self._infer_key(update_info) or "新节点"
 
-        return title, content
+        return key, content
 
-    def _infer_title(self, update_info: str) -> str:
+    def _infer_key(self, update_info: str) -> str:
         match = re.search(
-            r"(?:标题|title|节点标题)[:：]\s*([^\n]+)", update_info, re.IGNORECASE
+            r"(?:名称|name|节点名称|节点名|key)[:：]\s*([^\n]+)",
+            update_info,
+            re.IGNORECASE,
         )
         if match:
             return match.group(1).strip()[:30]
@@ -217,7 +219,10 @@ class WorldAgent:
             stats["max"] = max(stats["max"], int(number))
 
         if prefixed:
-            prefix = max(prefixed, key=lambda item: (prefixed[item]["count"], prefixed[item]["max"]))
+            prefix = max(
+                prefixed,
+                key=lambda item: (prefixed[item]["count"], prefixed[item]["max"]),
+            )
             base = f"{prefix}{prefixed[prefix]['max'] + 1}"
             return self._increment_key(base, existing)
 

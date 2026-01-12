@@ -139,8 +139,7 @@ const WorldView = (() => {
       .filter(Boolean);
     return {
       id: rootId,
-      title: node.title || rootId,
-      description: node.description || "",
+      key: node.key || node.title || rootId,
       value: node.value || "",
       depth,
       children,
@@ -314,7 +313,7 @@ const WorldView = (() => {
 
       const title = document.createElement("div");
       title.className = "node-title";
-      title.textContent = node.title || node.id;
+      title.textContent = node.key || node.id;
 
       header.appendChild(toggle);
       header.appendChild(title);
@@ -339,13 +338,6 @@ const WorldView = (() => {
       idLabel.className = "node-id";
       idLabel.textContent = node.id;
       body.appendChild(idLabel);
-
-      if (node.description) {
-        const desc = document.createElement("div");
-        desc.className = "node-desc";
-        desc.textContent = node.description;
-        body.appendChild(desc);
-      }
 
       const textarea = document.createElement("textarea");
       textarea.value = node.value || "";

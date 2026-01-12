@@ -104,13 +104,13 @@ class CharacterPromptBuilder:
         if mount_point:
             if mount_point.region_id:
                 location_lines.append(
-                    f"- 区域: {mount_point.region_id} {mount_point.region_title}"
+                    f"- 区域: {mount_point.region_id} {mount_point.region_key}"
                 )
             if mount_point.region_value:
                 location_lines.append(f"  区域说明: {mount_point.region_value}")
             if mount_point.polity_id:
                 location_lines.append(
-                    f"- 政体: {mount_point.polity_id} {mount_point.polity_title}"
+                    f"- 政体: {mount_point.polity_id} {mount_point.polity_key}"
                 )
             if mount_point.polity_value:
                 location_lines.append(f"  政体说明: {mount_point.polity_value}")

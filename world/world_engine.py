@@ -10,18 +10,16 @@ from llm_api.llm_client import LLMClient
 from world.world_prompt import (
     DEFAULT_WORLD_SPEC,
     MICRO_POLITY_ASPECTS,
-    MICRO_POLITY_DESCRIPTION,
-    MICRO_REGION_DESCRIPTION,
-    MICRO_REGIONS,
     WorldPromptBuilder,
 )
+
+DEFAULT_SPEC_PATH = Path(__file__).resolve().parent / "world_spec.md"
 
 
 @dataclass
 class WorldNode:
     identifier: str
-    title: str
-    description: str = ""
+    key: str
     value: str = ""
     parent: Optional["WorldNode"] = None
     children: Dict[str, "WorldNode"] = field(default_factory=dict)
@@ -38,14 +36,22 @@ class WorldNode:
 class WorldEngine:
     def __init__(
         self,
-        world_md_path: Optional[str] = None,
+        world_spec_path: Optional[str] = None,
         world_spec_text: Optional[str] = None,
+        user_pitch: Optional[str] = None,
         llm_client: Optional[LLMClient] = None,
+        auto_generate: bool = True,
+        progress_callback: Optional[Callable[[WorldNode, int, int], None]] = None,
+        max_retries: int = 2,
     ) -> None:
-        self.world_md_path = Path(world_md_path) if world_md_path else None
-        self.root = WorldNode(identifier="world", title="World")
-        self.macro = WorldNode(identifier="macro", title="Macro")
-        self.micro = WorldNode(identifier="micro", title="Micro")
+        self.world_spec_path = (
+            Path(world_spec_path)
+            if world_spec_path
+            else DEFAULT_SPEC_PATH
+        )
+        self.root = WorldNode(identifier="world", key="World")
+        self.macro = WorldNode(identifier="macro", key="Macro")
+        self.micro = WorldNode(identifier="micro", key="Micro")
         self.root.add_child(self.macro)
         self.root.add_child(self.micro)
         self.nodes: Dict[str, WorldNode] = {
@@ -54,10 +60,20 @@ class WorldEngine:
             "micro": self.micro,
         }
         self.llm_client = llm_client or LLMClient()
+        self.user_pitch = user_pitch or ""
+        self.max_retries = max_retries
+        if self.user_pitch:
+            self.root.value = self.user_pitch
 
         spec_text = self._load_spec_text(world_spec_text)
-        self._load_world_spec(spec_text)
-        self._seed_micro_structure()
+        self.spec_nodes, self.spec_hints = self._parse_world_spec(spec_text)
+        self._load_macro_nodes(self.spec_nodes)
+
+        if auto_generate and self.user_pitch:
+            self.generate_world(
+                self.user_pitch,
+                progress_callback=progress_callback,
+            )
 
     # Public API -----------------------------------------------------------------
     def view_node(self, identifier: str) -> WorldNode:
@@ -71,21 +87,17 @@ class WorldEngine:
         self,
         parent_identifier: str,
         child_key: str,
-        title: str,
-        description: str = "",
+        key: str,
     ) -> WorldNode:
         parent = self._require_node(parent_identifier)
-        child_identifier = (
-            child_key
-            if parent_identifier == "world"
-            else f"{parent_identifier}.{child_key}"
-        )
+        if parent_identifier in {"world", "macro"}:
+            child_identifier = child_key
+        else:
+            child_identifier = f"{parent_identifier}.{child_key}"
         if child_identifier in self.nodes:
             raise ValueError(f"Node {child_identifier} already exists")
 
-        child_node = WorldNode(
-            identifier=child_identifier, title=title, description=description
-        )
+        child_node = WorldNode(identifier=child_identifier, key=key)
         parent.add_child(child_node)
         self.nodes[child_identifier] = child_node
         return child_node
@@ -93,18 +105,15 @@ class WorldEngine:
     def add_node(
         self,
         identifier: str,
-        title: str,
+        key: str,
         parent_identifier: Optional[str] = None,
-        description: str = "",
     ) -> WorldNode:
         if identifier in self.nodes:
             raise ValueError(f"Node {identifier} already exists")
 
         parent_id = parent_identifier or self._infer_parent_id(identifier)
         parent_node = self._ensure_node(parent_id)
-        new_node = WorldNode(
-            identifier=identifier, title=title, description=description
-        )
+        new_node = WorldNode(identifier=identifier, key=key)
         parent_node.add_child(new_node)
         self.nodes[identifier] = new_node
         return new_node
@@ -118,32 +127,58 @@ class WorldEngine:
         user_pitch: str,
         regenerate: bool = False,
         progress_callback: Optional[Callable[[WorldNode, int, int], None]] = None,
+        max_retries: Optional[int] = None,
     ) -> Dict[str, str]:
+        self.user_pitch = user_pitch
         self.root.value = user_pitch
+        retries = max_retries if max_retries is not None else self.max_retries
+
         generated: Dict[str, str] = {}
-        nodes = self._iter_nodes(skip_root=True)
-        total = len(nodes)
         completed = 0
-        for node in nodes:
-            if node.value and not regenerate:
-                generated[node.identifier] = node.value
+
+        macro_nodes = self._iter_macro_nodes()
+        macro_total = len(macro_nodes)
+        for node in macro_nodes:
+            if node.value.strip() and not regenerate:
+                completed += 1
+                if progress_callback:
+                    progress_callback(node, completed, macro_total)
+                continue
+            parent_value = node.parent.value if node.parent else ""
+            prompt = WorldPromptBuilder.build_macro_prompt(
+                user_pitch=user_pitch,
+                node_identifier=node.identifier,
+                node_key=node.key,
+                hint=self.spec_hints.get(node.identifier, ""),
+                parent_value=parent_value,
+            )
+            node.value = self._generate_text_with_retry(
+                prompt,
+                system_prompt=WorldPromptBuilder.system_prompt(),
+                log_label=f"MACRO_{node.identifier}",
+                max_retries=retries,
+            )
+            generated[node.identifier] = node.value
+            completed += 1
+            if progress_callback:
+                progress_callback(node, completed, macro_total)
+
+        self._generate_micro_structure(retries=retries)
+
+        micro_nodes = self._iter_micro_nodes()
+        total = len(macro_nodes) + len(micro_nodes)
+        for node in micro_nodes:
+            if node.value.strip() and not regenerate:
                 completed += 1
                 if progress_callback:
                     progress_callback(node, completed, total)
                 continue
-
-            parent_value = node.parent.value if node.parent else ""
-            extra_context = self._build_micro_context(node)
-            prompt = WorldPromptBuilder.build_node_prompt(
-                user_pitch=user_pitch,
-                node=node,
-                parent_value=parent_value,
-                extra_context=extra_context,
-            )
-            node.value = self.llm_client.chat_once(
+            prompt = self._build_micro_value_prompt(node)
+            node.value = self._generate_text_with_retry(
                 prompt,
                 system_prompt=WorldPromptBuilder.system_prompt(),
-                log_label="WORLD",
+                log_label=f"MICRO_VALUE_{node.identifier}",
+                max_retries=retries,
             )
             generated[node.identifier] = node.value
             completed += 1
@@ -163,23 +198,33 @@ class WorldEngine:
 
     def apply_snapshot(self, snapshot: Dict[str, Dict[str, str]]) -> None:
         for identifier, node_data in snapshot.items():
-            title = node_data.get("title", identifier)
-            description = node_data.get("description", "")
-            value = node_data.get("value", "")
+            key = (
+                str(node_data.get("key", ""))
+                or str(node_data.get("title", ""))
+                or identifier
+            )
+            value = str(node_data.get("value", ""))
 
             if identifier == "world":
-                self.root.title = title
-                self.root.description = description
+                self.root.key = key
                 self.root.value = value
+                self.user_pitch = value
+                continue
+            if identifier == "macro":
+                self.macro.key = key
+                self.macro.value = value
+                continue
+            if identifier == "micro":
+                self.micro.key = key
+                self.micro.value = value
                 continue
 
             if identifier in self.nodes:
                 node = self.nodes[identifier]
-                node.title = title
-                node.description = description
+                node.key = key
                 node.value = value
             else:
-                node = self.add_node(identifier, title, description=description)
+                node = self.add_node(identifier, key)
                 node.value = value
 
     @classmethod
@@ -188,160 +233,251 @@ class WorldEngine:
     ) -> "WorldEngine":
         path = Path(snapshot_path)
         payload = json.loads(path.read_text(encoding="utf-8"))
-        engine = cls(world_md_path=None, llm_client=llm_client)
+        engine = cls(world_spec_path=None, llm_client=llm_client, auto_generate=False)
         engine.apply_snapshot(payload)
         return engine
 
-    def as_dict(self) -> Dict[str, Dict[str, str]]:
-        payload: Dict[str, Dict[str, str]] = {}
+    def as_dict(self) -> Dict[str, Dict[str, str | List[str]]]:
+        payload: Dict[str, Dict[str, str | List[str]]] = {}
         for node in self._iter_nodes():
             payload[node.identifier] = {
-                "title": node.title,
-                "description": node.description,
+                "key": node.key,
                 "value": node.value,
-                "children": list(node.children.keys()),
+                "children": sorted(node.children.keys()),
             }
         return payload
 
     # Internal helpers -----------------------------------------------------------
-    def _load_world_spec(self, spec_text: str) -> None:
+    def _load_spec_text(self, override: Optional[str]) -> str:
+        if override:
+            return override
+        if self.world_spec_path and self.world_spec_path.exists():
+            return self.world_spec_path.read_text(encoding="utf-8")
+        return DEFAULT_WORLD_SPEC
+
+    def _parse_world_spec(
+        self, spec_text: str
+    ) -> tuple[List[tuple[str, str]], Dict[str, str]]:
         lines = [line.strip() for line in spec_text.splitlines()]
-        current_node = self.root
+        nodes: List[tuple[str, str]] = []
+        hints: Dict[str, str] = {}
+        current_id: Optional[str] = None
         for line in lines:
             if not line:
                 continue
             parsed = self._parse_line_as_node(line)
             if parsed:
-                identifier, title = parsed
-                parent_id = self._infer_parent_id(identifier)
-                parent_node = self._ensure_node(parent_id)
-                node = self.nodes.get(identifier)
-                if node:
-                    if node.title.startswith("Placeholder"):
-                        node.title = title
-                    elif node.title != title:
-                        node.title = title
-                        node.description = ""
-                    if node.parent is None or node.parent.identifier != parent_node.identifier:
-                        parent_node.add_child(node)
-                    current_node = node
-                    continue
+                identifier, key = parsed
+                nodes.append((identifier, key))
+                current_id = identifier
+                continue
+            if current_id:
+                if current_id in hints:
+                    hints[current_id] = f"{hints[current_id]}\n{line}"
+                else:
+                    hints[current_id] = line
+        return nodes, hints
 
-                node = WorldNode(identifier=identifier, title=title, parent=parent_node)
-                parent_node.add_child(node)
-                self.nodes[identifier] = node
-                current_node = node
-            else:
-                target = current_node if current_node else self.root
-                target.description = (
-                    f"{target.description}\n{line}"
-                    if target.description
-                    else line
-                )
+    def _load_macro_nodes(self, spec_nodes: List[tuple[str, str]]) -> None:
+        for identifier, key in spec_nodes:
+            parent_id = self._infer_parent_id(identifier)
+            parent_node = self._ensure_node(parent_id)
+            node = self.nodes.get(identifier)
+            if node:
+                node.key = key
+                if node.parent is None or node.parent.identifier != parent_node.identifier:
+                    parent_node.add_child(node)
+                continue
+            new_node = WorldNode(identifier=identifier, key=key)
+            parent_node.add_child(new_node)
+            self.nodes[identifier] = new_node
 
-    def _load_spec_text(self, override: Optional[str]) -> str:
-        if override:
-            return override
-        if self.world_md_path and self.world_md_path.exists():
-            return self.world_md_path.read_text(encoding="utf-8")
-        return DEFAULT_WORLD_SPEC
+    def _generate_micro_structure(self, retries: int) -> None:
+        if self.micro.children:
+            return
+        macro_outline = self._build_macro_outline(skip_empty=True)
+        region_names = self._generate_name_list(
+            prompt_builder=lambda retry_note="": WorldPromptBuilder.build_region_list_prompt(
+                user_pitch=self.user_pitch,
+                macro_outline=macro_outline,
+                min_count=2,
+                max_count=7,
+                retry_note=retry_note,
+            ),
+            log_label="MICRO_REGIONS",
+            retries=retries,
+        )
 
-    def _build_micro_uniqueness_context(self, node: WorldNode) -> Optional[str]:
-        if not node.identifier.startswith("micro."):
-            return None
-        if not node.parent:
-            return None
+        for index, region_name in enumerate(region_names, start=1):
+            region_key = f"r{index}"
+            region_node = self.add_child("micro", region_key, region_name)
+            polity_names = self._generate_name_list(
+                prompt_builder=lambda retry_note="", region=region_name, regions=region_names: WorldPromptBuilder.build_polity_list_prompt(
+                    user_pitch=self.user_pitch,
+                    macro_outline=macro_outline,
+                    region_key=region,
+                    all_regions=regions,
+                    min_count=2,
+                    max_count=7,
+                    retry_note=retry_note,
+                ),
+                log_label=f"MICRO_POLITIES_{region_key}",
+                retries=retries,
+            )
+            for polity_index, polity_name in enumerate(polity_names, start=1):
+                polity_key = f"p{polity_index}"
+                polity_node = self.add_child(region_node.identifier, polity_key, polity_name)
+                for aspect_id, aspect_key in MICRO_POLITY_ASPECTS:
+                    self.add_child(polity_node.identifier, aspect_id, aspect_key)
 
-        parts = node.identifier.split(".")
-        label = None
-        if len(parts) == 2:
-            label = "已生成大地区"
-        elif len(parts) == 3 and parts[2].startswith("p"):
-            label = "已生成政权"
-        else:
-            return None
+    def _generate_name_list(
+        self,
+        prompt_builder: Callable[[str], str],
+        log_label: str,
+        retries: int,
+    ) -> List[str]:
+        last_error = ""
+        for attempt in range(retries + 1):
+            prompt = prompt_builder(last_error if attempt > 0 else "")
+            response = self.llm_client.chat_once(
+                prompt,
+                system_prompt=WorldPromptBuilder.system_prompt(),
+                log_label=log_label if attempt == 0 else f"{log_label}_RETRY_{attempt}",
+            )
+            try:
+                return self._parse_name_list(response)
+            except ValueError as exc:
+                last_error = str(exc)
+                continue
+        raise ValueError(f"Unable to parse name list for {log_label}: {last_error}")
 
-        siblings = [
-            sibling
-            for sibling in node.parent.children.values()
-            if sibling.identifier != node.identifier and sibling.value
-        ]
-        if not siblings:
-            return None
+    def _parse_name_list(self, response: str) -> List[str]:
+        cleaned = response.strip()
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start < 0 or end <= start:
+            raise ValueError("missing_json_array")
+        fragment = cleaned[start : end + 1]
+        try:
+            data = json.loads(fragment)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid_json: {exc}") from exc
+        if not isinstance(data, list):
+            raise ValueError("not_list")
+        names = []
+        seen = set()
+        for item in data:
+            if not isinstance(item, str):
+                continue
+            name = self._clean_name(item)
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+        if len(names) < 2 or len(names) > 7:
+            raise ValueError(f"invalid_count:{len(names)}")
+        return names
 
-        lines = [f"{label}（避免重复）："]
-        for sibling in sorted(siblings, key=lambda item: item.identifier):
-            lines.append(f"- {sibling.identifier} {sibling.title}: {sibling.value}")
-        return "\n".join(lines)
+    def _clean_name(self, raw: str) -> str:
+        name = raw.strip()
+        name = re.sub(r"^[\s\d\-\)\(\.、]+", "", name)
+        return name.strip()
 
-    def _build_macro_context(self) -> Optional[str]:
-        if not self.macro.children:
-            return None
-
-        lines = ["Macro 内容（用于微观设定参考）："]
-
+    def _build_macro_outline(self, skip_empty: bool = False) -> str:
+        lines: List[str] = []
         def dfs(node: WorldNode) -> None:
-            content = node.value or node.description
-            if content:
-                lines.append(f"- {node.identifier} {node.title}: {content}")
+            if node.identifier != "macro":
+                value = node.value.strip()
+                if value or not skip_empty:
+                    label = f"{node.identifier} {node.key}".strip()
+                    if value:
+                        lines.append(f"- {label}: {value}")
+                    else:
+                        lines.append(f"- {label}")
             for child in sorted(node.children.values(), key=lambda item: item.identifier):
                 dfs(child)
 
         dfs(self.macro)
-        return "\n".join(lines) if len(lines) > 1 else None
+        return "\n".join(lines) if lines else "无"
 
-    def _build_micro_context(self, node: WorldNode) -> Optional[str]:
-        if not node.identifier.startswith("micro."):
-            return None
+    def _build_micro_outline(self) -> str:
+        lines: List[str] = []
 
-        parts: list[str] = []
-        macro_context = self._build_macro_context()
-        if macro_context:
-            parts.append(macro_context)
+        def dfs(node: WorldNode, depth: int) -> None:
+            if node.identifier != "micro":
+                value = node.value.strip()
+                label = f"{node.identifier} {node.key}".strip()
+                prefix = "  " * depth + "- "
+                if value:
+                    lines.append(f"{prefix}{label}: {value}")
+                else:
+                    lines.append(f"{prefix}{label}")
+            for child in sorted(node.children.values(), key=lambda item: item.identifier):
+                dfs(child, depth + 1)
 
-        uniqueness_context = self._build_micro_uniqueness_context(node)
-        if uniqueness_context:
-            parts.append(uniqueness_context)
+        dfs(self.micro, 0)
+        return "\n".join(lines) if lines else "无"
 
-        return "\n\n".join(parts) if parts else None
+    def _build_micro_value_prompt(self, node: WorldNode) -> str:
+        macro_outline = self._build_macro_outline(skip_empty=True)
+        micro_outline = self._build_micro_outline()
+        target_path = self._build_node_path(node)
+        parent_value = node.parent.value if node.parent else ""
+        return WorldPromptBuilder.build_micro_value_prompt(
+            user_pitch=self.user_pitch,
+            macro_outline=macro_outline,
+            micro_outline=micro_outline,
+            target_path=target_path,
+            target_key=node.key,
+            parent_value=parent_value,
+        )
 
-    def _seed_micro_structure(self) -> None:
-        if self.micro.children:
-            return
+    def _build_node_path(self, node: WorldNode) -> str:
+        parts: List[str] = []
+        current = node
+        while current and current.identifier != "micro":
+            parts.append(current.key)
+            current = current.parent
+        return " > ".join(reversed(parts))
 
-        def add_if_missing(
-            parent_id: str, child_key: str, title: str, description: str = ""
-        ) -> WorldNode:
-            identifier = (
-                child_key if parent_id == "world" else f"{parent_id}.{child_key}"
+    def _generate_text_with_retry(
+        self,
+        prompt: str,
+        system_prompt: str,
+        log_label: str,
+        max_retries: int,
+    ) -> str:
+        output = self.llm_client.chat_once(
+            prompt,
+            system_prompt=system_prompt,
+            log_label=log_label,
+        )
+        if self._is_valid_value(output):
+            return output.strip()
+        for attempt in range(max_retries):
+            retry_prompt = (
+                f"{prompt}\n\n"
+                "上次输出无效或为空，请严格按要求生成内容，仅输出节点内容。"
             )
-            if identifier in self.nodes:
-                return self.nodes[identifier]
-            return self.add_child(parent_id, child_key, title, description=description)
-
-        for index, region_title in enumerate(MICRO_REGIONS, start=1):
-            region_key = f"r{index}"
-            region_node = add_if_missing(
-                "micro",
-                region_key,
-                region_title,
-                description=MICRO_REGION_DESCRIPTION,
+            output = self.llm_client.chat_once(
+                retry_prompt,
+                system_prompt=system_prompt,
+                log_label=f"{log_label}_RETRY_{attempt + 1}",
             )
-            for polity_index in range(1, 3):
-                polity_key = f"p{polity_index}"
-                polity_node = add_if_missing(
-                    region_node.identifier,
-                    polity_key,
-                    f"政权{polity_index}",
-                    description=MICRO_POLITY_DESCRIPTION,
-                )
-                for aspect_key, aspect_title, aspect_desc in MICRO_POLITY_ASPECTS:
-                    add_if_missing(
-                        polity_node.identifier,
-                        aspect_key,
-                        aspect_title,
-                        description=aspect_desc,
-                    )
+            if self._is_valid_value(output):
+                return output.strip()
+        return output.strip()
+
+    def _is_valid_value(self, text: str) -> bool:
+        cleaned = text.strip()
+        if not cleaned:
+            return False
+        if cleaned.startswith("Error in chat_once"):
+            return False
+        return True
 
     def _parse_line_as_node(self, line: str) -> Optional[tuple[str, str]]:
         cn_match = re.match(
@@ -361,6 +497,32 @@ class WorldEngine:
             return identifier, title
         return None
 
+    def _chinese_numeral_to_int(self, text: str) -> Optional[int]:
+        mapping = {
+            "一": 1,
+            "二": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+            "十": 10,
+        }
+        if text in mapping:
+            return mapping[text]
+        if len(text) == 2 and text[0] == "十" and text[1] in mapping:
+            return 10 + mapping[text[1]]
+        if len(text) == 2 and text[1] == "十" and text[0] in mapping:
+            return mapping[text[0]] * 10
+        if len(text) == 3 and text[1] == "十":
+            first = mapping.get(text[0])
+            last = mapping.get(text[2])
+            if first and last:
+                return first * 10 + last
+        return None
+
     def _infer_parent_id(self, identifier: str) -> str:
         if "." not in identifier:
             if identifier in {"world", "macro", "micro"}:
@@ -373,12 +535,14 @@ class WorldEngine:
             return self.nodes[identifier]
         if identifier == "world":
             return self.root
+        if identifier == "macro":
+            return self.macro
+        if identifier == "micro":
+            return self.micro
 
         parent_id = self._infer_parent_id(identifier)
         parent_node = self._ensure_node(parent_id)
-        placeholder = WorldNode(
-            identifier=identifier, title=f"Placeholder {identifier}"
-        )
+        placeholder = WorldNode(identifier=identifier, key=f"Placeholder {identifier}")
         parent_node.add_child(placeholder)
         self.nodes[identifier] = placeholder
         return placeholder
@@ -394,32 +558,27 @@ class WorldEngine:
         dfs(self.root)
         return [node for node in ordered if not (skip_root and node is self.root)]
 
+    def _iter_macro_nodes(self) -> List[WorldNode]:
+        nodes: List[WorldNode] = []
+        for identifier, _ in self.spec_nodes:
+            node = self.nodes.get(identifier)
+            if node:
+                nodes.append(node)
+        return nodes
+
+    def _iter_micro_nodes(self) -> List[WorldNode]:
+        nodes: List[WorldNode] = []
+
+        def dfs(node: WorldNode) -> None:
+            if node.identifier != "micro":
+                nodes.append(node)
+            for child in sorted(node.children.values(), key=lambda item: item.identifier):
+                dfs(child)
+
+        dfs(self.micro)
+        return nodes
+
     def _require_node(self, identifier: str) -> WorldNode:
         if identifier not in self.nodes:
             raise KeyError(f"Node {identifier} not found")
         return self.nodes[identifier]
-
-    def _chinese_numeral_to_int(self, text: str) -> Optional[int]:
-        mapping = {
-            "一": 1,
-            "二": 2,
-            "三": 3,
-            "四": 4,
-            "五": 5,
-            "六": 6,
-            "七": 7,
-            "八": 8,
-            "九": 9,
-            "十": 10,
-        }
-        if text == "十":
-            return 10
-        if len(text) == 1:
-            return mapping.get(text)
-        if text.startswith("十"):
-            return 10 + mapping.get(text[1], 0)
-        if text.endswith("十"):
-            return mapping.get(text[0], 0) * 10
-        if len(text) == 2:
-            return mapping.get(text[0], 0) * 10 + mapping.get(text[1], 0)
-        return None

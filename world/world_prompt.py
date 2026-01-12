@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 
 DEFAULT_WORLD_SPEC = """
 第一维度：世界基石 (World Foundation)
@@ -65,27 +63,14 @@ DEFAULT_WORLD_SPEC = """
 世界正在走向何种方向？
 """.strip()
 
-MICRO_REGIONS = [
-    "大地区一",
-    "大地区二",
-    "大地区三"
-    # "大地区四",
-    # "大地区五",
-    # "大地区六",
-    # "大地区七",
-]
-
-MICRO_REGION_DESCRIPTION = "该大地区的总体特征、范围与定位。"
-
-MICRO_POLITY_DESCRIPTION = "该政权的基本概况、核心利益与治理方式。"
-
 MICRO_POLITY_ASPECTS = [
-    ("culture", "文化", "信仰、价值观、传统、语言与日常风俗。"),
-    ("politics", "政治", "统治结构、权力交接、法律与执法体系。"),
-    ("economy", "经济", "产业结构、贸易方式、财富流通与支柱行业。"),
-    ("resources", "资源", "稀缺资源、控制方式与资源冲突。"),
-    ("geography", "地理", "地貌、气候、地理位置与战略要点。"),
-    ("population", "人口", "种族构成、人口规模、社会分层与迁徙。"),
+    ("culture", "文化"),
+    ("economy", "经济"),
+    ("politics", "政治"),
+    ("population", "人口"),
+    ("geography", "地理"),
+    ("technology", "技术"),
+    ("resources", "资源"),
 ]
 
 
@@ -98,27 +83,89 @@ class WorldPromptBuilder:
         )
 
     @staticmethod
-    def build_node_prompt(
+    def build_macro_prompt(
         user_pitch: str,
-        node: "WorldNode",
+        node_identifier: str,
+        node_key: str,
+        hint: str = "",
         parent_value: str = "",
-        extra_context: Optional[str] = None,
     ) -> str:
-        description = (node.description or "").strip() or "无明确说明则严格按现实世界情况填写，不能虚构内容。"
-        parent_section = (
-            f"\n父节点内容：\n{parent_value.strip()}\n" if parent_value.strip() else ""
-        )
-        extra_section = (
-            f"\n已生成内容（供参考，避免重复）：\n{extra_context.strip()}\n"
-            if extra_context
-            else ""
+        hint_text = hint.strip() or "无"
+        parent_block = f"\n父节点内容:\n{parent_value.strip()}\n" if parent_value.strip() else ""
+        return (
+            "【任务】生成宏观设定\n"
+            f"世界观初稿：{user_pitch.strip()}\n\n"
+            f"目标节点：{node_identifier} {node_key}\n"
+            f"节点提示：{hint_text}\n"
+            f"{parent_block}"
+            "输出要求：无明确说明则严格按现实世界情况填写，不能虚构内容。"
+            "直接输出该节点的设定内容，不要加标题或解释。"
         )
 
+    @staticmethod
+    def build_region_list_prompt(
+        user_pitch: str,
+        macro_outline: str,
+        min_count: int,
+        max_count: int,
+        retry_note: str = "",
+    ) -> str:
+        retry_block = f"\n注意：{retry_note}\n" if retry_note else ""
         return (
-            f"初始世界观（用户输入）：\n{user_pitch}\n\n"
-            f"你正在完善世界节点：{node.identifier} - {node.title}\n"
-            f"节点设计提示：\n{description}\n"
-            f"{parent_section}"
-            f"{extra_section}"
-            "生成该内容的具体设定，如果是问题，直接用最短的文字回答，否则生成简短描述。直接输出设定内容。"
+            "【任务】生成微观地区名称列表\n"
+            f"世界观初稿：{user_pitch.strip()}\n\n"
+            f"宏观设定摘要：\n{macro_outline.strip()}\n\n"
+            f"要求：生成 {min_count}-{max_count} 个地区名称。\n"
+            "约束：无明确说明则严格按现实世界情况填写，不能虚构内容。\n"
+            "输出格式：严格 JSON 数组，例如 [\"地区A\", \"地区B\"]。\n"
+            f"{retry_block}"
+            "只输出 JSON 数组，不要附加说明。"
+        )
+
+    @staticmethod
+    def build_polity_list_prompt(
+        user_pitch: str,
+        macro_outline: str,
+        region_key: str,
+        all_regions: list[str],
+        min_count: int,
+        max_count: int,
+        retry_note: str = "",
+    ) -> str:
+        retry_block = f"\n注意：{retry_note}\n" if retry_note else ""
+        region_text = "、".join(all_regions) if all_regions else "无"
+        return (
+            "【任务】生成地区内的政权名称列表\n"
+            f"世界观初稿：{user_pitch.strip()}\n\n"
+            f"宏观设定摘要：\n{macro_outline.strip()}\n\n"
+            f"已生成地区：{region_text}\n"
+            f"目标地区：{region_key}\n\n"
+            f"要求：生成 {min_count}-{max_count} 个政权名称。\n"
+            "约束：无明确说明则严格按现实世界情况填写，不能虚构内容。\n"
+            "输出格式：严格 JSON 数组，例如 [\"政权A\", \"政权B\"]。\n"
+            f"{retry_block}"
+            "只输出 JSON 数组，不要附加说明。"
+        )
+
+    @staticmethod
+    def build_micro_value_prompt(
+        user_pitch: str,
+        macro_outline: str,
+        micro_outline: str,
+        target_path: str,
+        target_key: str,
+        parent_value: str = "",
+    ) -> str:
+        parent_block = f"\n父节点内容：\n{parent_value.strip()}\n" if parent_value.strip() else ""
+        return (
+            "【任务】生成微观节点内容\n"
+            f"世界观初稿：{user_pitch.strip()}\n\n"
+            f"宏观设定摘要：\n{macro_outline.strip()}\n\n"
+            f"微观结构与已有内容：\n{micro_outline.strip()}\n\n"
+            f"目标节点路径：{target_path}\n"
+            f"目标节点名称：{target_key}\n"
+            f"{parent_block}"
+            "说明：同一地区内不同政权的内容允许存在相似之处，但需保持一致性。\n"
+            "输出要求：无明确说明则严格按现实世界情况填写，不能虚构内容。"
+            "直接输出该节点的具体内容，不要添加标题或解释。"
         )
