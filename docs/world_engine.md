@@ -21,14 +21,14 @@ World graph utilities backed by `world/world_engine.py` and `world/world_prompt.
 2) 逐个 macro 节点调用 LLM 填充 value。
 3) 单次对话生成 micro 地区名称列表（2-7 个）。
 4) 对每个地区单次对话生成政权名称列表（2-7 个），并为政权挂载 7 个固定子节点：文化/经济/政治/人口/地理/技术/资源。
-5) 遍历 micro 子树，若节点 value 为空则调用 LLM 补全。
+5) 遍历 micro 子树，若节点 value 为空则调用 LLM 补全（上下文包含宏观总结 + 其他父节点 key 列表 + 直接父节点 value）。
 
 ### 提示词生成（WorldPromptBuilder）
 - `system_prompt()`：统一系统提示。
 - `build_macro_prompt(...)`：宏观节点生成提示。
 - `build_region_list_prompt(...)`：地区名称列表提示（JSON 数组）。
 - `build_polity_list_prompt(...)`：政权名称列表提示（JSON 数组）。
-- `build_micro_value_prompt(...)`：微观节点 value 生成提示。
+- `build_micro_value_prompt(...)`：微观节点 value 生成提示（宏观总结 + 其他父节点 key 列表 + 直接父节点 value）。
 
 ## 使用示例
 ```python

@@ -62,6 +62,7 @@ class WorldEngine:
         self.llm_client = llm_client or LLMClient()
         self.user_pitch = user_pitch or ""
         self.max_retries = max_retries
+        self.macro_summary = ""
         if self.user_pitch:
             self.root.value = self.user_pitch
 
@@ -163,7 +164,13 @@ class WorldEngine:
             if progress_callback:
                 progress_callback(node, completed, macro_total)
 
-        self._generate_micro_structure(retries=retries)
+        if not self.macro_summary or regenerate:
+            self.macro_summary = self._generate_macro_summary(retries=retries)
+
+        self._generate_micro_structure(
+            macro_summary=self.macro_summary,
+            retries=retries,
+        )
 
         micro_nodes = self._iter_micro_nodes()
         total = len(macro_nodes) + len(micro_nodes)
@@ -292,14 +299,16 @@ class WorldEngine:
             parent_node.add_child(new_node)
             self.nodes[identifier] = new_node
 
-    def _generate_micro_structure(self, retries: int) -> None:
+    def _generate_micro_structure(self, macro_summary: str, retries: int) -> None:
         if self.micro.children:
             return
-        macro_outline = self._build_macro_outline(skip_empty=True)
+        summary = macro_summary.strip() or self._build_macro_outline(skip_empty=True)
+        if not summary:
+            summary = "无"
         region_names = self._generate_name_list(
             prompt_builder=lambda retry_note="": WorldPromptBuilder.build_region_list_prompt(
                 user_pitch=self.user_pitch,
-                macro_outline=macro_outline,
+                macro_summary=summary,
                 min_count=2,
                 max_count=7,
                 retry_note=retry_note,
@@ -314,7 +323,7 @@ class WorldEngine:
             polity_names = self._generate_name_list(
                 prompt_builder=lambda retry_note="", region=region_name, regions=region_names: WorldPromptBuilder.build_polity_list_prompt(
                     user_pitch=self.user_pitch,
-                    macro_outline=macro_outline,
+                    macro_summary=summary,
                     region_key=region,
                     all_regions=regions,
                     min_count=2,
@@ -422,17 +431,59 @@ class WorldEngine:
         return "\n".join(lines) if lines else "无"
 
     def _build_micro_value_prompt(self, node: WorldNode) -> str:
-        macro_outline = self._build_macro_outline(skip_empty=True)
-        micro_outline = self._build_micro_outline()
+        macro_summary = self.macro_summary.strip() or self._build_macro_outline(skip_empty=True)
+        if not macro_summary:
+            macro_summary = "无"
+        parent_keys_context = self._build_micro_parent_key_context(node)
         target_path = self._build_node_path(node)
-        parent_value = node.parent.value if node.parent else ""
         return WorldPromptBuilder.build_micro_value_prompt(
-            user_pitch=self.user_pitch,
-            macro_outline=macro_outline,
-            micro_outline=micro_outline,
+            macro_summary=macro_summary,
+            parent_keys_context=parent_keys_context,
             target_path=target_path,
             target_key=node.key,
-            parent_value=parent_value,
+        )
+
+    def _build_micro_parent_key_context(self, node: WorldNode) -> str:
+        parts: List[str] = []
+        regions = self.view_children("micro")
+        if regions:
+            region_line = " ".join(
+                f"{index}. {region.key}" for index, region in enumerate(regions, start=1)
+            )
+            parts.append("地区：")
+            parts.append(region_line)
+
+            for index, region in enumerate(regions, start=1):
+                polities = self.view_children(region.identifier)
+                polity_names = [polity.key for polity in polities]
+                if polity_names:
+                    polity_text = "; ".join(polity_names) + ";"
+                else:
+                    polity_text = "无;"
+                parts.append(f"地区{index}政权：{polity_text}")
+
+        parent = node.parent
+        if parent and parent.identifier != "micro":
+            parent_value = parent.value.strip() or "无"
+            parts.append(f"{parent.key}：{parent_value}")
+
+        if not parts:
+            return "无"
+        return "\n".join(parts)
+
+    def _generate_macro_summary(self, retries: int) -> str:
+        macro_outline = self._build_macro_outline(skip_empty=True)
+        if not macro_outline or macro_outline == "无":
+            return ""
+        prompt = WorldPromptBuilder.build_macro_summary_prompt(
+            user_pitch=self.user_pitch,
+            macro_outline=macro_outline,
+        )
+        return self._generate_text_with_retry(
+            prompt,
+            system_prompt=WorldPromptBuilder.system_prompt(),
+            log_label="MACRO_SUMMARY",
+            max_retries=retries,
         )
 
     def _build_node_path(self, node: WorldNode) -> str:

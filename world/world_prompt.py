@@ -98,14 +98,14 @@ class WorldPromptBuilder:
             f"目标节点：{node_identifier} {node_key}\n"
             f"节点提示：{hint_text}\n"
             f"{parent_block}"
-            "输出要求：无明确说明则严格按现实世界情况填写，不能虚构内容。"
+            "输出要求：生成内容要基于设定，但若无明确说明时则严格按现实世界情况填写，不能虚构内容。"
             "直接输出该节点的设定内容，不要加标题或解释。"
         )
 
     @staticmethod
     def build_region_list_prompt(
         user_pitch: str,
-        macro_outline: str,
+        macro_summary: str,
         min_count: int,
         max_count: int,
         retry_note: str = "",
@@ -114,9 +114,9 @@ class WorldPromptBuilder:
         return (
             "【任务】生成微观地区名称列表\n"
             f"世界观初稿：{user_pitch.strip()}\n\n"
-            f"宏观设定摘要：\n{macro_outline.strip()}\n\n"
-            f"要求：生成 {min_count}-{max_count} 个地区名称。\n"
-            "约束：无明确说明则严格按现实世界情况填写，不能虚构内容。\n"
+            f"宏观设定摘要：\n{macro_summary.strip()}\n\n"
+            f"要求：生成 {min_count}-{max_count} 个地区名称，地区需为大洲/大陆级别。\n"
+            "约束：生成内容要基于设定，但若无明确说明时则严格按现实世界情况填写，不能虚构内容。\n"
             "输出格式：严格 JSON 数组，例如 [\"地区A\", \"地区B\"]。\n"
             f"{retry_block}"
             "只输出 JSON 数组，不要附加说明。"
@@ -125,7 +125,7 @@ class WorldPromptBuilder:
     @staticmethod
     def build_polity_list_prompt(
         user_pitch: str,
-        macro_outline: str,
+        macro_summary: str,
         region_key: str,
         all_regions: list[str],
         min_count: int,
@@ -137,35 +137,40 @@ class WorldPromptBuilder:
         return (
             "【任务】生成地区内的政权名称列表\n"
             f"世界观初稿：{user_pitch.strip()}\n\n"
-            f"宏观设定摘要：\n{macro_outline.strip()}\n\n"
+            f"宏观设定摘要：\n{macro_summary.strip()}\n\n"
             f"已生成地区：{region_text}\n"
             f"目标地区：{region_key}\n\n"
             f"要求：生成 {min_count}-{max_count} 个政权名称。\n"
-            "约束：无明确说明则严格按现实世界情况填写，不能虚构内容。\n"
+            "约束：生成内容要基于设定，但若无明确说明时则严格按现实世界情况填写，不能虚构内容。\n"
             "输出格式：严格 JSON 数组，例如 [\"政权A\", \"政权B\"]。\n"
             f"{retry_block}"
             "只输出 JSON 数组，不要附加说明。"
         )
 
     @staticmethod
+    def build_macro_summary_prompt(user_pitch: str, macro_outline: str) -> str:
+        return (
+            "【任务】生成宏观总结\n"
+            f"世界观初稿：{user_pitch.strip()}\n\n"
+            f"宏观设定详情：\n{macro_outline.strip()}\n\n"
+            "输出要求：生成内容要基于设定，但若无明确说明时则严格按现实世界情况填写，不能虚构内容。"
+            "总结为简短条目或短段落，用于微观生成上下文，不要添加标题或解释。"
+        )
+
+    @staticmethod
     def build_micro_value_prompt(
-        user_pitch: str,
-        macro_outline: str,
-        micro_outline: str,
+        macro_summary: str,
+        parent_keys_context: str,
         target_path: str,
         target_key: str,
-        parent_value: str = "",
     ) -> str:
-        parent_block = f"\n父节点内容：\n{parent_value.strip()}\n" if parent_value.strip() else ""
         return (
             "【任务】生成微观节点内容\n"
-            f"世界观初稿：{user_pitch.strip()}\n\n"
-            f"宏观设定摘要：\n{macro_outline.strip()}\n\n"
-            f"微观结构与已有内容：\n{micro_outline.strip()}\n\n"
-            f"目标节点路径：{target_path}\n"
-            f"目标节点名称：{target_key}\n"
-            f"{parent_block}"
+            f"宏观设定摘要：\n{macro_summary.strip()}\n\n"
+            f"{parent_keys_context.strip()}\n\n"
+            f"需要生成：{target_path} 中 {target_key} 对应的 value\n"
             "说明：同一地区内不同政权的内容允许存在相似之处，但需保持一致性。\n"
-            "输出要求：无明确说明则严格按现实世界情况填写，不能虚构内容。"
+            "输出要求：生成内容要基于设定，但若无明确说明时则严格按现实世界情况填写，不能虚构内容。"
+            "仅生成该目标 key 对应的 value，不要输出其他节点内容。"
             "直接输出该节点的具体内容，不要添加标题或解释。"
         )

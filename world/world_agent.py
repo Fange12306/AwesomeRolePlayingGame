@@ -28,7 +28,14 @@ class WorldAgent:
 
     def extract_info(self, query: str) -> str:
         prompt = self._build_extract_prompt(query)
-        return self.llm_client.chat_once(prompt, system_prompt=self._system_prompt())
+        response = self.llm_client.chat_once(prompt, system_prompt=self._system_prompt())
+        key = self._parse_query_key(response)
+        if not key:
+            return "无相关信息"
+        node = self._find_node_by_key(key)
+        if not node or not node.value.strip():
+            return "无相关信息"
+        return node.value
 
     def decide_action(self, update_info: str) -> ActionDecision:
         prompt = self._build_decision_prompt(update_info)
@@ -49,18 +56,34 @@ class WorldAgent:
     # Prompt builders -----------------------------------------------------
     def _build_extract_prompt(self, query: str) -> str:
         lines = [
-            "【任务】提取信息",
-            "仅使用世界节点内容回答，严禁添加未提供的信息。",
-            "如果没有相关信息，只输出：无相关信息",
+            "【任务】选择查询节点",
+            "从下列 key 中选择最相关的一项。",
+            "只输出 key 本身，不要输出其他内容。",
+            "如果没有相关信息，只输出：无相关信息。",
             f"查询：{query.strip()}",
-            "世界节点：",
+            "可用 key：",
         ]
         for node in self._iter_nodes():
-            content = (node.value or "").strip()
-            if not content:
-                continue
-            lines.append(f"- {node.identifier} {node.key}: {content}")
+            lines.append(f"- {node.key}")
         return "\n".join(lines)
+
+    def _parse_query_key(self, response: str) -> str:
+        cleaned = response.strip().strip("\"'")
+        if cleaned in {"无相关信息", "无"}:
+            return ""
+        keys = [node.key for node in self._iter_nodes()]
+        if cleaned in keys:
+            return cleaned
+        for key in keys:
+            if key and key in cleaned:
+                return key
+        return ""
+
+    def _find_node_by_key(self, key: str) -> Optional[WorldNode]:
+        for node in self._iter_nodes():
+            if node.key == key:
+                return node
+        return None
 
     def _build_decision_prompt(self, update_info: str) -> str:
         lines = [

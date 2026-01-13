@@ -20,8 +20,10 @@ class DummyLLMClient:
         self.calls.append(log_label or "")
         if log_label and log_label.startswith("MACRO_"):
             return f"{log_label} 设定内容"
+        if log_label == "MACRO_SUMMARY":
+            return "宏观总结：该世界以大陆尺度划分，气候与资源分布明确。"
         if log_label == "MICRO_REGIONS":
-            return json.dumps(["霜谷", "雾岭"], ensure_ascii=False)
+            return json.dumps(["北大陆", "南大陆"], ensure_ascii=False)
         if log_label and log_label.startswith("MICRO_POLITIES_"):
             return json.dumps(["北境议会", "林雾教团"], ensure_ascii=False)
         if log_label and log_label.startswith("MICRO_VALUE_"):
