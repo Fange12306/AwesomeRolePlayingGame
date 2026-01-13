@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Optional
 
 from llm_api.llm_client import LLMClient
@@ -10,6 +12,21 @@ from world.world_engine import WorldEngine, WorldNode
 
 ADD_TAG = "<|ADD_NODE|>"
 UPDATE_TAG = "<|UPDATE_NODE|>"
+DEFAULT_LOG_PATH = Path("log") / "world_agent.log"
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger("world_agent")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
 
 
 @dataclass(frozen=True)
@@ -25,32 +42,51 @@ class WorldAgent:
     ) -> None:
         self.engine = engine
         self.llm_client = llm_client or engine.llm_client or LLMClient()
+        self.logger = _get_logger()
+        self.logger.info("init world_agent nodes=%s", len(self.engine.nodes))
 
     def extract_info(self, query: str) -> str:
         prompt = self._build_extract_prompt(query)
-        response = self.llm_client.chat_once(prompt, system_prompt=self._system_prompt())
+        response = self._chat_once(
+            prompt, system_prompt=self._system_prompt(), log_label="EXTRACT"
+        )
         key = self._parse_query_key(response)
         if not key:
+            self.logger.info("extract_info miss query_len=%s", len(query))
             return "无相关信息"
         node = self._find_node_by_key(key)
         if not node or not node.value.strip():
+            self.logger.info("extract_info empty key=%s", key)
             return "无相关信息"
+        self.logger.info("extract_info hit key=%s value_len=%s", key, len(node.value))
         return node.value
 
     def decide_action(self, update_info: str) -> ActionDecision:
         prompt = self._build_decision_prompt(update_info)
-        response = self.llm_client.chat_once(prompt, system_prompt=self._system_prompt())
+        response = self._chat_once(
+            prompt, system_prompt=self._system_prompt(), log_label="DECIDE"
+        )
         flag, index = self._parse_decision(response)
         if index not in self.engine.nodes:
             raise ValueError(f"Node {index} not found for decision")
+        self.logger.info(
+            "decide_action flag=%s index=%s info_len=%s",
+            flag,
+            index,
+            len(update_info),
+        )
         return ActionDecision(flag=flag, index=index, raw=response)
 
     def apply_update(self, flag: str, index: str, update_info: str) -> WorldNode:
         normalized = self._normalize_flag(flag)
         if normalized == ADD_TAG:
-            return self._apply_add(index, update_info)
+            node = self._apply_add(index, update_info)
+            self.logger.info("apply_update add parent=%s child=%s", index, node.identifier)
+            return node
         if normalized == UPDATE_TAG:
-            return self._apply_update(index, update_info)
+            node = self._apply_update(index, update_info)
+            self.logger.info("apply_update update index=%s", index)
+            return node
         raise ValueError(f"Unknown flag: {flag}")
 
     # Prompt builders -----------------------------------------------------
@@ -133,7 +169,9 @@ class WorldAgent:
     def _apply_update(self, index: str, update_info: str) -> WorldNode:
         node = self.engine.view_node(index)
         prompt = self._build_update_prompt(node, update_info)
-        response = self.llm_client.chat_once(prompt, system_prompt=self._system_prompt())
+        response = self._chat_once(
+            prompt, system_prompt=self._system_prompt(), log_label="UPDATE_NODE"
+        )
         content = response.strip()
         self.engine.update_node_content(index, content)
         return node
@@ -141,7 +179,9 @@ class WorldAgent:
     def _apply_add(self, index: str, update_info: str) -> WorldNode:
         parent = self.engine.view_node(index)
         prompt = self._build_add_prompt(parent, update_info)
-        response = self.llm_client.chat_once(prompt, system_prompt=self._system_prompt())
+        response = self._chat_once(
+            prompt, system_prompt=self._system_prompt(), log_label="ADD_NODE"
+        )
         key, content = self._parse_key_and_value(response, update_info)
         child_key = self._choose_child_key(parent)
         node = self.engine.add_child(parent.identifier, child_key, key)
@@ -279,3 +319,17 @@ class WorldAgent:
             "You are a precise world-building assistant. "
             "Follow formatting instructions exactly and avoid extra commentary."
         )
+
+    def _chat_once(
+        self, prompt: str, system_prompt: str, log_label: Optional[str] = None
+    ) -> str:
+        label = log_label or ""
+        self.logger.info("LLM_INPUT label=%s system=%s", label, system_prompt)
+        self.logger.info("LLM_INPUT label=%s prompt=%s", label, prompt)
+        output = self.llm_client.chat_once(
+            prompt,
+            system_prompt=system_prompt,
+            log_label=log_label,
+        )
+        self.logger.info("LLM_OUTPUT label=%s output=%s", label, output)
+        return output

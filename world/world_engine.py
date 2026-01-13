@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +15,21 @@ from world.world_prompt import (
 )
 
 DEFAULT_SPEC_PATH = Path(__file__).resolve().parent / "world_spec.md"
+DEFAULT_LOG_PATH = Path("log") / "world_engine.log"
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger("world_engine")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
 
 
 @dataclass
@@ -44,6 +60,7 @@ class WorldEngine:
         progress_callback: Optional[Callable[[WorldNode, int, int], None]] = None,
         max_retries: int = 2,
     ) -> None:
+        self.logger = _get_logger()
         self.world_spec_path = (
             Path(world_spec_path)
             if world_spec_path
@@ -65,6 +82,12 @@ class WorldEngine:
         self.macro_summary = ""
         if self.user_pitch:
             self.root.value = self.user_pitch
+
+        self.logger.info(
+            "init world_engine auto_generate=%s user_pitch_len=%s",
+            auto_generate,
+            len(self.user_pitch),
+        )
 
         spec_text = self._load_spec_text(world_spec_text)
         self.spec_nodes, self.spec_hints = self._parse_world_spec(spec_text)
@@ -133,6 +156,12 @@ class WorldEngine:
         self.user_pitch = user_pitch
         self.root.value = user_pitch
         retries = max_retries if max_retries is not None else self.max_retries
+        self.logger.info(
+            "generate_world start regenerate=%s retries=%s pitch_len=%s",
+            regenerate,
+            retries,
+            len(user_pitch),
+        )
 
         generated: Dict[str, str] = {}
         completed = 0
@@ -173,6 +202,11 @@ class WorldEngine:
         )
 
         micro_nodes = self._iter_micro_nodes()
+        self.logger.info(
+            "generate_world macro_total=%s micro_total=%s",
+            macro_total,
+            len(micro_nodes),
+        )
         total = len(macro_nodes) + len(micro_nodes)
         for node in micro_nodes:
             if node.value.strip() and not regenerate:
@@ -192,6 +226,11 @@ class WorldEngine:
             if progress_callback:
                 progress_callback(node, completed, total)
 
+        self.logger.info(
+            "generate_world done generated=%s total=%s",
+            len(generated),
+            total,
+        )
         return generated
 
     def save_snapshot(self, output_path: str | Path) -> None:
@@ -202,6 +241,7 @@ class WorldEngine:
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
+        self.logger.info("save_snapshot path=%s nodes=%s", path, len(payload))
 
     def apply_snapshot(self, snapshot: Dict[str, Dict[str, str]]) -> None:
         for identifier, node_data in snapshot.items():
@@ -233,6 +273,7 @@ class WorldEngine:
             else:
                 node = self.add_node(identifier, key)
                 node.value = value
+        self.logger.info("apply_snapshot nodes=%s", len(snapshot))
 
     @classmethod
     def from_snapshot(
@@ -242,6 +283,7 @@ class WorldEngine:
         payload = json.loads(path.read_text(encoding="utf-8"))
         engine = cls(world_spec_path=None, llm_client=llm_client, auto_generate=False)
         engine.apply_snapshot(payload)
+        engine.logger.info("from_snapshot path=%s nodes=%s", path, len(payload))
         return engine
 
     def as_dict(self) -> Dict[str, Dict[str, str | List[str]]]:
@@ -348,7 +390,7 @@ class WorldEngine:
         last_error = ""
         for attempt in range(retries + 1):
             prompt = prompt_builder(last_error if attempt > 0 else "")
-            response = self.llm_client.chat_once(
+            response = self._chat_once(
                 prompt,
                 system_prompt=WorldPromptBuilder.system_prompt(),
                 log_label=log_label if attempt == 0 else f"{log_label}_RETRY_{attempt}",
@@ -501,7 +543,7 @@ class WorldEngine:
         log_label: str,
         max_retries: int,
     ) -> str:
-        output = self.llm_client.chat_once(
+        output = self._chat_once(
             prompt,
             system_prompt=system_prompt,
             log_label=log_label,
@@ -513,7 +555,7 @@ class WorldEngine:
                 f"{prompt}\n\n"
                 "上次输出无效或为空，请严格按要求生成内容，仅输出节点内容。"
             )
-            output = self.llm_client.chat_once(
+            output = self._chat_once(
                 retry_prompt,
                 system_prompt=system_prompt,
                 log_label=f"{log_label}_RETRY_{attempt + 1}",
@@ -529,6 +571,20 @@ class WorldEngine:
         if cleaned.startswith("Error in chat_once"):
             return False
         return True
+
+    def _chat_once(
+        self, prompt: str, system_prompt: str, log_label: Optional[str] = None
+    ) -> str:
+        label = log_label or ""
+        self.logger.info("LLM_INPUT label=%s system=%s", label, system_prompt)
+        self.logger.info("LLM_INPUT label=%s prompt=%s", label, prompt)
+        output = self.llm_client.chat_once(
+            prompt,
+            system_prompt=system_prompt,
+            log_label=log_label,
+        )
+        self.logger.info("LLM_OUTPUT label=%s output=%s", label, output)
+        return output
 
     def _parse_line_as_node(self, line: str) -> Optional[tuple[str, str]]:
         cn_match = re.match(

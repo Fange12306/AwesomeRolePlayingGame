@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import cycle
@@ -13,6 +14,22 @@ from character.character_prompt import (
     LocationRelationPromptBuilder,
     RelationPromptBuilder,
 )
+
+DEFAULT_LOG_PATH = Path("log") / "character_engine.log"
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger("character_engine")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
 
 
 @dataclass
@@ -61,12 +78,18 @@ class CharacterEngine:
         world_snapshot_path: Optional[str | Path] = None,
         llm_client: Optional[LLMClient] = None,
     ) -> None:
+        self.logger = _get_logger()
         self.world_snapshot_path = Path(world_snapshot_path) if world_snapshot_path else None
         self.world_snapshot = self._load_world_snapshot(world_snapshot)
         self.llm_client = llm_client or LLMClient()
         self.records: List[CharacterRecord] = []
         self.relations: List[Dict[str, object]] = []
         self.location_edges: List[Dict[str, object]] = []
+        self.logger.info(
+            "init character_engine snapshot_path=%s snapshot_nodes=%s",
+            self.world_snapshot_path,
+            len(self.world_snapshot),
+        )
 
     @classmethod
     def from_world_snapshot(
@@ -76,6 +99,7 @@ class CharacterEngine:
 
     def set_world_snapshot(self, snapshot: Dict[str, Dict[str, object]]) -> None:
         self.world_snapshot = snapshot
+        self.logger.info("set_world_snapshot nodes=%s", len(snapshot))
 
     def extract_mount_points(self) -> List[MountPoint]:
         micro = self.world_snapshot.get("micro")
@@ -155,9 +179,17 @@ class CharacterEngine:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         max_retries: int = 1,
     ) -> List[CharacterRecord]:
+        self.logger.info(
+            "generate_characters start total=%s regenerate=%s retries=%s pitch_len=%s",
+            request.total,
+            regenerate,
+            max_retries,
+            len(request.pitch),
+        )
         if self.records and not regenerate:
             if progress_callback:
                 progress_callback(len(self.records), len(self.records))
+            self.logger.info("generate_characters reuse count=%s", len(self.records))
             return self.records
 
         mount_points = self.extract_mount_points()
@@ -194,6 +226,7 @@ class CharacterEngine:
                 progress_callback(completed, total)
 
         self.records = records
+        self.logger.info("generate_characters done count=%s", len(records))
         return records
 
     def generate_relations(
@@ -205,13 +238,14 @@ class CharacterEngine:
 
         character_lines = [self._summarize_character(record) for record in records]
         prompt = RelationPromptBuilder.build_prompt(character_lines)
-        output = self.llm_client.chat_once(
+        output = self._chat_once(
             prompt,
             system_prompt=RelationPromptBuilder.system_prompt(),
             log_label="RELATION",
         )
         relations = self._parse_relations(output)
         self.relations = relations
+        self.logger.info("generate_relations count=%s", len(relations))
         return relations
 
     def save_snapshot(
@@ -232,6 +266,7 @@ class CharacterEngine:
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
+        self.logger.info("save_snapshot path=%s characters=%s", path, len(payload["characters"]))
 
     def _load_world_snapshot(
         self, override: Optional[Dict[str, Dict[str, object]]]
@@ -284,11 +319,25 @@ class CharacterEngine:
                     return output.strip()
         return output.strip()
 
+    def _chat_once(
+        self, prompt: str, system_prompt: str, log_label: Optional[str] = None
+    ) -> str:
+        label = log_label or ""
+        self.logger.info("LLM_INPUT label=%s system=%s", label, system_prompt)
+        self.logger.info("LLM_INPUT label=%s prompt=%s", label, prompt)
+        output = self.llm_client.chat_once(
+            prompt,
+            system_prompt=system_prompt,
+            log_label=log_label,
+        )
+        self.logger.info("LLM_OUTPUT label=%s output=%s", label, output)
+        return output
+
     def _generate_profile_with_retry(
         self, prompt: str, max_retries: int = 1
     ) -> Dict[str, object] | str:
         system_prompt = CharacterPromptBuilder.system_prompt()
-        output = self.llm_client.chat_once(
+        output = self._chat_once(
             prompt,
             system_prompt=system_prompt,
             log_label="CHARACTER",
@@ -302,7 +351,7 @@ class CharacterEngine:
                 "上次输出格式不符合要求，请重新生成。\n"
                 "要求：只输出单个 JSON 对象，禁止数组或多角色，且不要 Markdown。"
             )
-            output = self.llm_client.chat_once(
+            output = self._chat_once(
                 retry_prompt,
                 system_prompt=system_prompt,
                 log_label=f"CHARACTER_RETRY_{attempt + 1}",
@@ -332,7 +381,7 @@ class CharacterEngine:
         prompt = LocationRelationPromptBuilder.build_prompt(
             character_lines, location_lines, base_lines
         )
-        output = self.llm_client.chat_once(
+        output = self._chat_once(
             prompt,
             system_prompt=LocationRelationPromptBuilder.system_prompt(),
             log_label="LOCATION_RELATION",
@@ -342,6 +391,12 @@ class CharacterEngine:
             base_edges, extra_edges, location_lookup, {r.identifier for r in records}
         )
         self.location_edges = merged
+        self.logger.info(
+            "generate_location_edges base=%s extra=%s merged=%s",
+            len(base_edges),
+            len(extra_edges),
+            len(merged),
+        )
         return merged
 
     def _collect_location_nodes(self) -> List[Dict[str, str]]:
