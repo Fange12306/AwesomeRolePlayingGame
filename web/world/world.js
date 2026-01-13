@@ -1,24 +1,12 @@
 const WorldView = (() => {
-  const NODE_WIDTH = 240;
-  const COLLAPSED_HEIGHT = 64;
-  const EXPANDED_HEIGHT = 210;
-  const H_GAP = 280;
-  const V_GAP = 90;
-  const PADDING = 80;
-  const MIN_SCALE = 0.4;
-  const MAX_SCALE = 1.6;
-  const ZOOM_STEP = 1.12;
-
   let elements = {};
   let snapshot = null;
-  let collapsedNodes = new Set();
-  let openNodes = new Set();
-  let collapseInitialized = false;
+  let activeTab = "macro";
+  let selectedId = "";
   let pendingSaves = new Map();
-  let pan = { x: 0, y: 0 };
-  let scale = 1;
-  let sceneSize = { width: 0, height: 0 };
-  let dragState = null;
+  let collapsedNodes = new Set();
+  let collapseInitialized = { macro: false, micro: false };
+  let isEditing = false;
 
   function init(config) {
     const root = document.getElementById(config.rootId);
@@ -30,59 +18,105 @@ const WorldView = (() => {
       <div class="world-header">
         <div>
           <h2>世界设定</h2>
-          <p class="hint">拖动画布浏览结构，节点可折叠，编辑自动保存。</p>
+          <p class="hint">左侧切换宏观/具体设定，点击条目后可在右侧实时修改。</p>
         </div>
         <div class="world-meta">
           <div class="save-path"></div>
-          <div class="world-tools">
-            <button class="world-tool" data-action="zoom-out" type="button">-</button>
-            <button class="world-tool" data-action="zoom-in" type="button">+</button>
-            <button class="world-tool" data-action="fit" type="button">适配</button>
-          </div>
         </div>
       </div>
       <div class="world-status"></div>
-      <div class="world-board">
-        <div class="world-scene">
-          <svg class="world-lines"></svg>
-          <div class="world-canvas"></div>
-        </div>
+      <div class="world-panel">
+        <aside class="world-list">
+          <div class="world-tabs">
+            <button class="world-tab is-active" data-tab="macro" type="button">世界设定</button>
+            <button class="world-tab" data-tab="micro" type="button">具体设定</button>
+          </div>
+          <div class="world-list-scroll">
+            <div class="world-list-empty">暂无条目</div>
+            <ul class="world-items"></ul>
+          </div>
+        </aside>
+        <section class="world-detail">
+          <div class="world-detail-empty">请先在左侧选择一个条目。</div>
+          <div class="world-detail-content">
+            <div class="world-detail-head">
+              <div>
+                <div class="detail-title"></div>
+                <div class="detail-meta"></div>
+              </div>
+              <button class="detail-toggle" type="button">编辑</button>
+            </div>
+            <div class="detail-preview"></div>
+            <textarea class="detail-textarea" rows="12" placeholder="在这里补充设定内容..."></textarea>
+          </div>
+        </section>
       </div>
     `;
 
     elements = {
       root,
-      board: root.querySelector(".world-board"),
-      scene: root.querySelector(".world-scene"),
-      canvas: root.querySelector(".world-canvas"),
-      lines: root.querySelector(".world-lines"),
       status: root.querySelector(".world-status"),
       savePath: root.querySelector(".save-path"),
+      tabs: Array.from(root.querySelectorAll(".world-tab")),
+      list: root.querySelector(".world-items"),
+      listEmpty: root.querySelector(".world-list-empty"),
+      detailEmpty: root.querySelector(".world-detail-empty"),
+      detailContent: root.querySelector(".world-detail-content"),
+      detailTitle: root.querySelector(".detail-title"),
+      detailMeta: root.querySelector(".detail-meta"),
+      detailToggle: root.querySelector(".detail-toggle"),
+      detailPreview: root.querySelector(".detail-preview"),
+      detailTextarea: root.querySelector(".detail-textarea"),
     };
 
-    if (!elements.board || !elements.scene || !elements.canvas || !elements.lines) {
-      return;
-    }
-
-    elements.board.addEventListener("pointerdown", onPointerDown);
-    elements.board.addEventListener("pointermove", onPointerMove);
-    elements.board.addEventListener("pointerup", onPointerUp);
-    elements.board.addEventListener("pointerleave", onPointerUp);
-
-    root.querySelectorAll(".world-tool").forEach((button) => {
+    elements.tabs.forEach((button) => {
       button.addEventListener("click", () => {
-        const action = button.dataset.action;
-        if (action === "zoom-in") {
-          zoomBy(ZOOM_STEP);
-        } else if (action === "zoom-out") {
-          zoomBy(1 / ZOOM_STEP);
-        } else if (action === "fit") {
-          fitToView();
-        }
+        setActiveTab(button.dataset.tab || "macro");
       });
     });
 
-    setPan(0, 0);
+    if (elements.list) {
+      elements.list.addEventListener("click", (event) => {
+        const toggle = event.target.closest(".world-item-toggle");
+        if (toggle) {
+          const nodeId = toggle.dataset.nodeId || toggle.closest(".world-item")?.dataset.nodeId;
+          if (nodeId) {
+            toggleCollapse(nodeId);
+          }
+          return;
+        }
+        const main = event.target.closest(".world-item-main");
+        if (!main) {
+          return;
+        }
+        const nodeId = main.dataset.nodeId || main.closest(".world-item")?.dataset.nodeId;
+        if (nodeId) {
+          selectNode(nodeId);
+        }
+      });
+    }
+
+    if (elements.detailTextarea) {
+      elements.detailTextarea.addEventListener("input", () => {
+        if (!selectedId) {
+          return;
+        }
+        scheduleSave(selectedId, elements.detailTextarea.value);
+        updatePreview(elements.detailTextarea.value);
+      });
+    }
+
+    if (elements.detailToggle) {
+      elements.detailToggle.addEventListener("click", () => {
+        setEditing(!isEditing);
+      });
+    }
+
+    if (elements.detailPreview) {
+      elements.detailPreview.addEventListener("click", () => {
+        setEditing(true);
+      });
+    }
   }
 
   async function load() {
@@ -93,30 +127,34 @@ const WorldView = (() => {
         throw new Error("暂无世界数据。");
       }
       snapshot = data.snapshot;
-      collapsedNodes.clear();
-      openNodes.clear();
-      collapseInitialized = false;
       pendingSaves.forEach((timer) => clearTimeout(timer));
       pendingSaves.clear();
+      collapsedNodes.clear();
+      collapseInitialized = { macro: false, micro: false };
       if (elements.savePath) {
         elements.savePath.textContent = data.save_path
           ? `存档：${data.save_path}`
           : "";
       }
       render();
-      fitToView();
-      setStatus("世界结构已加载，修改会自动保存。", false);
+      setStatus("世界设定已加载，修改会自动保存。", false);
     } catch (error) {
       snapshot = null;
-      if (elements.canvas) {
-        elements.canvas.innerHTML = "";
-      }
-      if (elements.lines) {
-        elements.lines.innerHTML = "";
+      if (elements.list) {
+        elements.list.innerHTML = "";
       }
       if (elements.savePath) {
         elements.savePath.textContent = "";
       }
+      if (elements.detailTextarea) {
+        elements.detailTextarea.value = "";
+      }
+      if (elements.detailPreview) {
+        elements.detailPreview.innerHTML = "";
+      }
+      selectedId = "";
+      isEditing = false;
+      renderDetail();
       setStatus(error.message, true);
     }
   }
@@ -129,227 +167,374 @@ const WorldView = (() => {
     elements.status.classList.toggle("is-error", Boolean(isError));
   }
 
-  function buildTree(data, rootId, depth = 0) {
-    const node = data[rootId];
-    if (!node) {
-      return null;
-    }
-    const children = (node.children || [])
-      .map((childId) => buildTree(data, childId, depth + 1))
-      .filter(Boolean);
-    return {
-      id: rootId,
-      key: node.key || node.title || rootId,
-      value: node.value || "",
-      depth,
-      children,
-      childCount: children.length,
-    };
-  }
-
-  function initializeCollapse(node) {
-    if (!node) {
+  function setActiveTab(tab) {
+    const nextTab = tab === "micro" ? "micro" : "macro";
+    if (nextTab === activeTab) {
       return;
     }
-    if (node.depth >= 1) {
-      collapsedNodes.add(node.id);
-    }
-    node.children.forEach(initializeCollapse);
-  }
-
-  function applyCollapse(node) {
-    if (collapsedNodes.has(node.id)) {
-      node.children = [];
-      return;
-    }
-    node.children.forEach(applyCollapse);
-  }
-
-  function assignHeights(node) {
-    node.height = openNodes.has(node.id) ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT;
-    node.children.forEach(assignHeights);
-  }
-
-  function layoutTree(node, depth, yStart) {
-    node.x = depth * H_GAP;
-    if (!node.children.length) {
-      node.y = yStart;
-      return node.height;
-    }
-
-    let currentY = yStart;
-    const childCenters = [];
-    for (const child of node.children) {
-      const childHeight = layoutTree(child, depth + 1, currentY);
-      childCenters.push(child.y + child.height / 2);
-      currentY += childHeight + V_GAP;
-    }
-
-    const totalHeight = currentY - yStart - V_GAP;
-    const centerY =
-      childCenters.length === 1
-        ? childCenters[0]
-        : (childCenters[0] + childCenters[childCenters.length - 1]) / 2;
-    node.y = centerY - node.height / 2;
-    return Math.max(totalHeight, node.height);
-  }
-
-  function collect(node, nodes, links) {
-    nodes.push(node);
-    node.children.forEach((child) => {
-      links.push({ from: node, to: child });
-      collect(child, nodes, links);
-    });
+    activeTab = nextTab;
+    render();
   }
 
   function render() {
-    if (!snapshot || !elements.canvas || !elements.scene || !elements.lines) {
+    if (!snapshot || !elements.list) {
       return;
     }
-    const root = buildTree(snapshot, "world", 0);
+    elements.tabs.forEach((button) => {
+      button.classList.toggle("is-active", button.dataset.tab === activeTab);
+    });
+    ensureCollapseInitialized();
+    renderList();
+    renderDetail();
+  }
+
+  function ensureCollapseInitialized() {
+    if (collapseInitialized[activeTab]) {
+      return;
+    }
+    const rootId = activeTab === "micro" ? "micro" : "macro";
+    const root = snapshot?.[rootId];
     if (!root) {
-      setStatus("世界根节点不存在。", true);
       return;
     }
-
-    if (!collapseInitialized) {
-      initializeCollapse(root);
-      collapseInitialized = true;
-    }
-    applyCollapse(root);
-    assignHeights(root);
-    layoutTree(root, 0, 0);
-
-    const nodes = [];
-    const links = [];
-    collect(root, nodes, links);
-
-    const maxX = Math.max(...nodes.map((node) => node.x));
-    const maxY = Math.max(...nodes.map((node) => node.y + node.height));
-    const sceneWidth = maxX + NODE_WIDTH + PADDING * 2;
-    const sceneHeight = maxY + PADDING * 2;
-    sceneSize = { width: sceneWidth, height: sceneHeight };
-
-    elements.scene.style.width = `${sceneWidth}px`;
-    elements.scene.style.height = `${sceneHeight}px`;
-
-    renderLines(links, sceneWidth, sceneHeight);
-    renderNodes(nodes);
+    const walk = (nodeId) => {
+      const node = snapshot?.[nodeId];
+      if (!node) {
+        return;
+      }
+      if ((node.children || []).length) {
+        collapsedNodes.add(nodeId);
+      }
+      (node.children || []).forEach((childId) => walk(childId));
+    };
+    (root.children || []).forEach((childId) => walk(childId));
+    collapseInitialized[activeTab] = true;
   }
 
-  function renderLines(links, width, height) {
-    if (!elements.lines) {
-      return;
+  function buildNodeList(rootId) {
+    const root = snapshot?.[rootId];
+    if (!root) {
+      return [];
     }
-    elements.lines.setAttribute("width", String(width));
-    elements.lines.setAttribute("height", String(height));
-    elements.lines.setAttribute("viewBox", `0 0 ${width} ${height}`);
-    elements.lines.innerHTML =
-      '<defs><linearGradient id="lineGlow" x1="0" x2="1" y1="0" y2="1">'
-      + '<stop offset="0%" stop-color="#d86a4b" stop-opacity="0.6" />'
-      + '<stop offset="100%" stop-color="#5c5147" stop-opacity="0.6" />'
-      + '</linearGradient></defs>';
-
-    for (const link of links) {
-      const startX = link.from.x + PADDING + NODE_WIDTH;
-      const startY = link.from.y + PADDING + link.from.height / 2;
-      const endX = link.to.x + PADDING;
-      const endY = link.to.y + PADDING + link.to.height / 2;
-      const midX = startX + (endX - startX) * 0.5;
-      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      path.setAttribute(
-        "d",
-        `M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`
-      );
-      path.setAttribute("stroke", "url(#lineGlow)");
-      path.setAttribute("stroke-width", "2");
-      path.setAttribute("fill", "none");
-      path.setAttribute("stroke-linecap", "round");
-      elements.lines.appendChild(path);
-    }
+    const items = [];
+    const walk = (nodeId, depth) => {
+      const node = snapshot?.[nodeId];
+      if (!node) {
+        return;
+      }
+      const children = node.children || [];
+      items.push({
+        id: nodeId,
+        key: node.key || node.title || nodeId,
+        value: node.value || "",
+        depth,
+        childCount: children.length,
+        isCollapsed: collapsedNodes.has(nodeId),
+      });
+      if (!collapsedNodes.has(nodeId)) {
+        children.forEach((childId) => walk(childId, depth + 1));
+      }
+    };
+    (root.children || []).forEach((childId) => walk(childId, 0));
+    return items;
   }
 
-  function renderNodes(nodes) {
-    if (!elements.canvas) {
+  function renderList() {
+    if (!elements.list) {
       return;
     }
-    elements.canvas.innerHTML = "";
+    const items = buildNodeList(activeTab === "micro" ? "micro" : "macro");
+    elements.list.innerHTML = "";
+    if (!items.length) {
+      if (elements.listEmpty) {
+        elements.listEmpty.style.display = "block";
+      }
+      selectedId = "";
+      return;
+    }
+    if (elements.listEmpty) {
+      elements.listEmpty.style.display = "none";
+    }
+    if (!selectedId || !items.some((item) => item.id === selectedId)) {
+      selectedId = items[0].id;
+      isEditing = false;
+    }
     const fragment = document.createDocumentFragment();
-    for (const node of nodes) {
-      const card = document.createElement("div");
-      card.className = "world-node";
-      card.dataset.nodeId = node.id;
-      card.dataset.depth = String(node.depth);
-      card.classList.toggle("is-open", openNodes.has(node.id));
-      card.style.transform = `translate(${node.x + PADDING}px, ${node.y + PADDING}px)`;
-      card.style.minHeight = `${node.height}px`;
-
-      const header = document.createElement("div");
-      header.className = "node-head";
-
-      const toggle = document.createElement("button");
-      toggle.className = "node-toggle";
-      toggle.type = "button";
-      const hasChildren = node.childCount > 0;
-      const isCollapsed = collapsedNodes.has(node.id);
-      toggle.textContent = hasChildren ? (isCollapsed ? "+" : "-") : "o";
-      toggle.title = hasChildren ? (isCollapsed ? "展开" : "折叠") : "无子节点";
-      toggle.disabled = !hasChildren;
-      if (hasChildren) {
-        toggle.addEventListener("click", (event) => {
-          event.stopPropagation();
-          const wasCollapsed = collapsedNodes.has(node.id);
-          if (collapsedNodes.has(node.id)) {
-            collapsedNodes.delete(node.id);
-          } else {
-            collapsedNodes.add(node.id);
-          }
-          render();
-          if (wasCollapsed) {
-            fitToView();
-          }
-        });
+    for (const item of items) {
+      const li = document.createElement("li");
+      const row = document.createElement("div");
+      row.className = "world-item";
+      row.dataset.nodeId = item.id;
+      row.style.paddingLeft = `${16 + item.depth * 18}px`;
+      if (item.id === selectedId) {
+        row.classList.add("is-active");
       }
 
+      if (item.childCount > 0) {
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "world-item-toggle";
+        toggle.dataset.nodeId = item.id;
+        toggle.textContent = item.isCollapsed ? "+" : "-";
+        toggle.title = item.isCollapsed ? "展开" : "收起";
+        row.appendChild(toggle);
+      } else {
+        const spacer = document.createElement("span");
+        spacer.className = "world-item-spacer";
+        row.appendChild(spacer);
+      }
+
+      const main = document.createElement("button");
+      main.type = "button";
+      main.className = "world-item-main";
+      main.dataset.nodeId = item.id;
+
       const title = document.createElement("div");
-      title.className = "node-title";
-      title.textContent = node.key || node.id;
+      title.className = "world-item-title";
+      title.textContent = item.key;
 
-      header.appendChild(toggle);
-      header.appendChild(title);
-      card.appendChild(header);
+      const meta = document.createElement("div");
+      meta.className = "world-item-meta";
+      meta.textContent = item.id;
 
-      header.addEventListener("click", () => {
-        const wasOpen = openNodes.has(node.id);
-        if (wasOpen) {
-          openNodes.delete(node.id);
-        } else {
-          openNodes.add(node.id);
-        }
-        render();
-        if (!wasOpen) {
-          fitToView();
-        }
-      });
-
-      const body = document.createElement("div");
-      body.className = "node-body";
-      const idLabel = document.createElement("div");
-      idLabel.className = "node-id";
-      idLabel.textContent = node.id;
-      body.appendChild(idLabel);
-
-      const textarea = document.createElement("textarea");
-      textarea.value = node.value || "";
-      textarea.addEventListener("input", () => {
-        scheduleSave(node.id, textarea.value);
-      });
-      body.appendChild(textarea);
-      card.appendChild(body);
-
-      fragment.appendChild(card);
+      main.appendChild(title);
+      main.appendChild(meta);
+      row.appendChild(main);
+      li.appendChild(row);
+      fragment.appendChild(li);
     }
-    elements.canvas.appendChild(fragment);
+    elements.list.appendChild(fragment);
+  }
+
+  function renderDetail() {
+    if (!elements.detailContent || !elements.detailEmpty || !elements.detailTextarea) {
+      return;
+    }
+    const node = snapshot?.[selectedId];
+    if (!node) {
+      elements.detailEmpty.style.display = "flex";
+      elements.detailContent.style.display = "none";
+      elements.detailTextarea.value = "";
+      if (elements.detailPreview) {
+        elements.detailPreview.innerHTML = "";
+      }
+      return;
+    }
+    elements.detailEmpty.style.display = "none";
+    elements.detailContent.style.display = "flex";
+    if (elements.detailTitle) {
+      elements.detailTitle.textContent = node.key || node.title || node.identifier || selectedId;
+    }
+    if (elements.detailMeta) {
+      elements.detailMeta.textContent = selectedId;
+    }
+    elements.detailTextarea.value = node.value || "";
+    updatePreview(node.value || "");
+    updateDetailMode();
+  }
+
+  function selectNode(nodeId) {
+    if (!nodeId || nodeId === selectedId) {
+      return;
+    }
+    const current = elements.list?.querySelector(".world-item.is-active");
+    if (current) {
+      current.classList.remove("is-active");
+    }
+    const next = elements.list?.querySelector(`[data-node-id="${nodeId}"]`);
+    if (next) {
+      next.classList.add("is-active");
+    }
+    selectedId = nodeId;
+    isEditing = false;
+    renderDetail();
+  }
+
+  function toggleCollapse(nodeId) {
+    if (!nodeId) {
+      return;
+    }
+    if (collapsedNodes.has(nodeId)) {
+      collapsedNodes.delete(nodeId);
+    } else {
+      collapsedNodes.add(nodeId);
+    }
+    render();
+  }
+
+  function setEditing(next) {
+    if (!selectedId) {
+      return;
+    }
+    isEditing = Boolean(next);
+    if (!isEditing) {
+      updatePreview(elements.detailTextarea?.value || "");
+    }
+    updateDetailMode();
+    if (isEditing && elements.detailTextarea) {
+      elements.detailTextarea.focus();
+      elements.detailTextarea.selectionStart = elements.detailTextarea.value.length;
+      elements.detailTextarea.selectionEnd = elements.detailTextarea.value.length;
+    }
+  }
+
+  function updateDetailMode() {
+    if (!elements.detailPreview || !elements.detailTextarea || !elements.detailToggle) {
+      return;
+    }
+    const showEditor = isEditing && Boolean(selectedId);
+    elements.detailPreview.style.display = showEditor ? "none" : "block";
+    elements.detailTextarea.style.display = showEditor ? "block" : "none";
+    elements.detailToggle.textContent = showEditor ? "预览" : "编辑";
+  }
+
+  function updatePreview(value) {
+    if (!elements.detailPreview) {
+      return;
+    }
+    const trimmed = (value || "").trim();
+    if (!trimmed) {
+      elements.detailPreview.innerHTML = '<div class="detail-preview-empty">暂无内容，点击开始编辑。</div>';
+      return;
+    }
+    elements.detailPreview.innerHTML = renderMarkdown(value);
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function renderInlineMarkdown(text) {
+    let html = escapeHtml(text);
+    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    html = html.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+    html = html.replace(/_([^_]+)_/g, "<em>$1</em>");
+    html = html.replace(/\n/g, "<br>");
+    return html;
+  }
+
+  function renderMarkdown(text) {
+    const chunks = String(text || "").split(/```/);
+    const output = [];
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      if (index % 2 === 1) {
+        output.push(`<pre><code>${escapeHtml(chunk.trim())}</code></pre>`);
+      } else {
+        output.push(renderMarkdownBlocks(chunk));
+      }
+    }
+    return output.join("");
+  }
+
+  function renderMarkdownBlocks(text) {
+    const lines = String(text || "").split(/\r?\n/);
+    const output = [];
+    let paragraph = [];
+    let blockquote = [];
+    let inUl = false;
+    let inOl = false;
+
+    const closeLists = () => {
+      if (inUl) {
+        output.push("</ul>");
+        inUl = false;
+      }
+      if (inOl) {
+        output.push("</ol>");
+        inOl = false;
+      }
+    };
+
+    const flushParagraph = () => {
+      if (!paragraph.length) {
+        return;
+      }
+      output.push(`<p>${renderInlineMarkdown(paragraph.join("\n"))}</p>`);
+      paragraph = [];
+    };
+
+    const flushBlockquote = () => {
+      if (!blockquote.length) {
+        return;
+      }
+      output.push(`<blockquote><p>${renderInlineMarkdown(blockquote.join("\n"))}</p></blockquote>`);
+      blockquote = [];
+    };
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      const headingMatch = trimmed.match(/^(#{1,4})\s+(.*)$/);
+      const ulMatch = trimmed.match(/^[-*+]\s+(.*)$/);
+      const olMatch = trimmed.match(/^\d+\.\s+(.*)$/);
+      const isQuote = trimmed.startsWith(">");
+
+      if (!trimmed) {
+        flushParagraph();
+        flushBlockquote();
+        closeLists();
+        continue;
+      }
+
+      if (headingMatch) {
+        flushParagraph();
+        flushBlockquote();
+        closeLists();
+        const level = headingMatch[1].length;
+        output.push(`<h${level}>${renderInlineMarkdown(headingMatch[2])}</h${level}>`);
+        continue;
+      }
+
+      if (ulMatch) {
+        flushParagraph();
+        flushBlockquote();
+        if (inOl) {
+          output.push("</ol>");
+          inOl = false;
+        }
+        if (!inUl) {
+          output.push("<ul>");
+          inUl = true;
+        }
+        output.push(`<li>${renderInlineMarkdown(ulMatch[1])}</li>`);
+        continue;
+      }
+
+      if (olMatch) {
+        flushParagraph();
+        flushBlockquote();
+        if (inUl) {
+          output.push("</ul>");
+          inUl = false;
+        }
+        if (!inOl) {
+          output.push("<ol>");
+          inOl = true;
+        }
+        output.push(`<li>${renderInlineMarkdown(olMatch[1])}</li>`);
+        continue;
+      }
+
+      if (isQuote) {
+        flushParagraph();
+        closeLists();
+        blockquote.push(trimmed.replace(/^>\s?/, ""));
+        continue;
+      }
+
+      paragraph.push(line);
+    }
+
+    flushParagraph();
+    flushBlockquote();
+    closeLists();
+
+    return output.join("");
   }
 
   function scheduleSave(nodeId, value) {
@@ -381,101 +566,6 @@ const WorldView = (() => {
     } catch (error) {
       setStatus(`保存失败：${error.message}`, true);
     }
-  }
-
-  function onPointerDown(event) {
-    if (event.button !== 0) {
-      return;
-    }
-    if (event.target.closest(".world-node")) {
-      return;
-    }
-    dragState = {
-      startX: event.clientX,
-      startY: event.clientY,
-      panX: pan.x,
-      panY: pan.y,
-      pointerId: event.pointerId,
-    };
-    elements.board.classList.add("is-dragging");
-    elements.board.setPointerCapture(event.pointerId);
-  }
-
-  function onPointerMove(event) {
-    if (!dragState) {
-      return;
-    }
-    const dx = event.clientX - dragState.startX;
-    const dy = event.clientY - dragState.startY;
-    setPan(dragState.panX + dx, dragState.panY + dy);
-  }
-
-  function onPointerUp(event) {
-    if (!dragState) {
-      return;
-    }
-    if (dragState.pointerId !== undefined) {
-      elements.board.releasePointerCapture(dragState.pointerId);
-    }
-    dragState = null;
-    elements.board.classList.remove("is-dragging");
-  }
-
-  function setPan(x, y) {
-    pan.x = x;
-    pan.y = y;
-    applyTransform();
-  }
-
-  function clampScale(value) {
-    return Math.min(MAX_SCALE, Math.max(MIN_SCALE, value));
-  }
-
-  function applyTransform() {
-    if (elements.scene) {
-      elements.scene.style.transform = `translate(${pan.x}px, ${pan.y}px) scale(${scale})`;
-    }
-  }
-
-  function setScale(nextScale, focus) {
-    const clamped = clampScale(nextScale);
-    if (focus) {
-      const ratio = clamped / scale;
-      pan.x = focus.x - (focus.x - pan.x) * ratio;
-      pan.y = focus.y - (focus.y - pan.y) * ratio;
-    }
-    scale = clamped;
-    applyTransform();
-  }
-
-  function zoomBy(factor) {
-    if (!elements.board) {
-      return;
-    }
-    const rect = elements.board.getBoundingClientRect();
-    const focus = { x: rect.width / 2, y: rect.height / 2 };
-    setScale(scale * factor, focus);
-  }
-
-  function fitToView() {
-    if (!elements.board || !sceneSize.width || !sceneSize.height) {
-      return;
-    }
-    const boardWidth = elements.board.clientWidth;
-    const boardHeight = elements.board.clientHeight;
-    if (!boardWidth || !boardHeight) {
-      return;
-    }
-    const margin = 40;
-    const widthAvail = Math.max(boardWidth - margin * 2, 1);
-    const heightAvail = Math.max(boardHeight - margin * 2, 1);
-    const targetScale = clampScale(
-      Math.min(widthAvail / sceneSize.width, heightAvail / sceneSize.height)
-    );
-    scale = targetScale;
-    pan.x = (boardWidth - sceneSize.width * targetScale) / 2;
-    pan.y = (boardHeight - sceneSize.height * targetScale) / 2;
-    applyTransform();
   }
 
   return {
