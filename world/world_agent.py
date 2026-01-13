@@ -50,15 +50,17 @@ class WorldAgent:
         response = self._chat_once(
             prompt, system_prompt=self._system_prompt(), log_label="EXTRACT"
         )
-        key = self._parse_query_key(response)
-        if not key:
+        identifier = self._parse_query_identifier(response)
+        if not identifier:
             self.logger.info("extract_info miss query_len=%s", len(query))
             return "无相关信息"
-        node = self._find_node_by_key(key)
+        node = self.engine.nodes.get(identifier)
         if not node or not node.value.strip():
-            self.logger.info("extract_info empty key=%s", key)
+            self.logger.info("extract_info empty id=%s", identifier)
             return "无相关信息"
-        self.logger.info("extract_info hit key=%s value_len=%s", key, len(node.value))
+        self.logger.info(
+            "extract_info hit id=%s value_len=%s", identifier, len(node.value)
+        )
         return node.value
 
     def decide_action(self, update_info: str) -> ActionDecision:
@@ -93,32 +95,26 @@ class WorldAgent:
     def _build_extract_prompt(self, query: str) -> str:
         lines = [
             "【任务】选择查询节点",
-            "从下列 key 中选择最相关的一项。",
-            "只输出 key 本身，不要输出其他内容。",
+            "从下列编号中选择最相关的一项。",
+            "只输出编号本身，不要输出其他内容。",
             "如果没有相关信息，只输出：无相关信息。",
             f"查询：{query.strip()}",
-            "可用 key：",
+            "可用编号：",
         ]
         for node in self._iter_nodes():
-            lines.append(f"- {node.key}")
+            lines.append(f"- {node.identifier} {node.key}")
         return "\n".join(lines)
 
-    def _parse_query_key(self, response: str) -> str:
+    def _parse_query_identifier(self, response: str) -> str:
         cleaned = response.strip().strip("\"'")
         if cleaned in {"无相关信息", "无"}:
             return ""
-        keys = [node.key for node in self._iter_nodes()]
-        if cleaned in keys:
+        identifiers = [node.identifier for node in self._iter_nodes()]
+        if cleaned in identifiers:
             return cleaned
-        for key in keys:
-            if key and key in cleaned:
-                return key
-        return ""
-
-    def _find_node_by_key(self, key: str) -> Optional[WorldNode]:
-        for node in self._iter_nodes():
-            if node.key == key:
-                return node
+        for identifier in identifiers:
+            if identifier and identifier in cleaned:
+                return identifier
         return None
 
     def _build_decision_prompt(self, update_info: str) -> str:

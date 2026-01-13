@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import random
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Tuple
 
 from llm_api.llm_client import LLMClient
-from world.world_agent import WorldAgent
+from world.world_agent import ADD_TAG, WorldAgent
 from world.world_engine import WorldEngine
+
+
+@dataclass
+class TestResult:
+    name: str
+    success: bool
+    detail: str = ""
 
 
 def find_latest_snapshot() -> Path | None:
@@ -27,6 +37,131 @@ def find_latest_snapshot() -> Path | None:
     return max(snapshots, key=lambda item: item.stat().st_mtime)
 
 
+def summarize_results(title: str, results: List[TestResult]) -> None:
+    total = len(results)
+    passed = sum(1 for result in results if result.success)
+    rate = (passed / total * 100) if total else 0.0
+    print(f"\n[{title}] {passed}/{total} ({rate:.1f}%)")
+    for index, result in enumerate(results, start=1):
+        status = "PASS" if result.success else "FAIL"
+        detail = f" - {result.detail}" if result.detail else ""
+        print(f"{index}. {status}: {result.name}{detail}")
+
+
+def choose_query_targets(engine: WorldEngine) -> List[Tuple[str, str]]:
+    regions = engine.view_children("micro") if "micro" in engine.nodes else []
+    if not regions:
+        return []
+
+    targets: List[Tuple[str, str]] = []
+    for region in regions:
+        polities = engine.view_children(region.identifier)
+        if not polities:
+            continue
+        for polity in polities:
+            aspects = engine.view_children(polity.identifier)
+            if not aspects:
+                continue
+            for aspect in aspects:
+                expected = (aspect.value or "").strip()
+                if not expected:
+                    continue
+                query = f"查询{region.key}地区{polity.key}政权的{aspect.key}内容"
+                targets.append((query, expected))
+        if targets:
+            break
+
+    if not targets:
+        return []
+    random.shuffle(targets)
+    return targets[:3]
+
+
+def run_query_tests(agent: WorldAgent, engine: WorldEngine) -> List[TestResult]:
+    results: List[TestResult] = []
+    targets = choose_query_targets(engine)
+    if not targets:
+        return [TestResult("query", False, "no_query_targets")]
+
+    for query, expected in targets:
+        try:
+            response = agent.extract_info(query).strip()
+        except Exception as exc:
+            results.append(TestResult(query, False, f"exception: {exc}"))
+            continue
+        success = bool(response and response == expected)
+        if success:
+            detail = "matched"
+        else:
+            resp_snip = response[:80].replace("\n", " ") if response else ""
+            exp_snip = expected[:80].replace("\n", " ") if expected else ""
+            detail = (
+                "mismatch "
+                f"(expected_len={len(expected)}, got_len={len(response)}) "
+                f"expected='{exp_snip}' got='{resp_snip}'"
+            )
+        results.append(TestResult(query, success, detail))
+    return results
+
+
+def run_add_tests(agent: WorldAgent, engine: WorldEngine) -> List[TestResult]:
+    results: List[TestResult] = []
+    if "micro" not in engine.nodes:
+        return [TestResult("add", False, "missing_micro_root")]
+    for index in range(1, 4):
+        update_info = f"新增节点测试{index}，名称：测试新增{index}"
+        try:
+            node = agent.apply_update(
+                ADD_TAG,
+                "micro",
+                f"剧情信息：这是测试新增内容{index}。",
+            )
+        except Exception as exc:
+            results.append(TestResult(f"add-{index}", False, f"exception: {exc}"))
+            continue
+        success = node.key.startswith("测试新增") and bool(node.value.strip())
+        if success:
+            detail = f"node={node.identifier}"
+        else:
+            reason = "key_mismatch" if node and not node.key.startswith("测试新增") else "empty_value"
+            detail = f"{reason}; node={node.identifier}"
+        results.append(TestResult(f"add-{index}", success, detail))
+    return results
+
+
+def run_update_tests(agent: WorldAgent, engine: WorldEngine) -> List[TestResult]:
+    results: List[TestResult] = []
+    updatable = [
+        node
+        for node in engine.nodes.values()
+        if node.identifier not in {"world", "macro", "micro"} and node.value.strip()
+    ]
+    if not updatable:
+        return [TestResult("update", False, "no_updatable_nodes")]
+
+    random.shuffle(updatable)
+    for index in range(1, 4):
+        target = updatable[(index - 1) % len(updatable)]
+        update_info = f"补充{target.key}细节 {index}"
+        try:
+            decision = agent.decide_action(update_info)
+            node = agent.apply_update(
+                decision.flag,
+                decision.index,
+                f"剧情信息：追加说明{index}。",
+            )
+        except Exception as exc:
+            results.append(TestResult(f"update-{index}", False, f"exception: {exc}"))
+            continue
+        success = bool(node.value.strip())
+        if success:
+            detail = f"node={node.identifier}"
+        else:
+            detail = f"empty_value; node={node.identifier}"
+        results.append(TestResult(f"update-{index}", success, detail))
+    return results
+
+
 def run_demo() -> None:
     snapshot = find_latest_snapshot()
     if not snapshot:
@@ -39,27 +174,16 @@ def run_demo() -> None:
 
     print(f"使用存档：{snapshot}")
 
-    print("\n[提取信息]")
-    extract = agent.extract_info("主导势力")
-    print(extract)
+    query_results = run_query_tests(agent, engine)
+    add_results = run_add_tests(agent, engine)
+    update_results = run_update_tests(agent, engine)
 
-    print("\n[判断操作 + 新增节点]")
-    decision_add = agent.decide_action("剧情信息：新增一个关于未来走向的节点，名称：未来走向。")
-    new_node = agent.apply_update(
-        decision_add.flag,
-        decision_add.index,
-        "剧情信息：世界经历能源枯竭，社会开始分裂并形成新的迁徙潮。",
-    )
-    print(f"新增节点：{new_node.identifier} {new_node.key} -> {new_node.value}")
+    summarize_results("查询测试", query_results)
+    summarize_results("新增测试", add_results)
+    summarize_results("更新测试", update_results)
 
-    print("\n[判断操作 + 修改节点]")
-    decision_update = agent.decide_action("剧情信息：补充核心设定的细节")
-    updated_node = agent.apply_update(
-        decision_update.flag,
-        decision_update.index,
-        "剧情信息：核心力量会消耗持有者寿命，且必须以特定仪式启动。",
-    )
-    print(f"修改节点：{updated_node.identifier} {updated_node.key} -> {updated_node.value}")
+    overall = query_results + add_results + update_results
+    summarize_results("总体成功率", overall)
 
 
 if __name__ == "__main__":
