@@ -35,6 +35,26 @@
   color: #8f3b2b;
 }
 
+.world-stage {
+  display: none;
+  margin-bottom: 12px;
+}
+
+.world-stage.is-active {
+  display: block;
+}
+
+.world-stage .progress-text {
+  margin-top: 6px;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.world-root.is-locked .detail-preview {
+  cursor: default;
+  opacity: 0.85;
+}
+
 .world-panel {
   display: flex;
   gap: 18px;

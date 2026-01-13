@@ -7,6 +7,8 @@ const WorldView = (() => {
   let collapsedNodes = new Set();
   let collapseInitialized = { macro: false, micro: false };
   let isEditing = false;
+  let isLocked = false;
+  let statusTimer = null;
 
   function init(config) {
     const root = document.getElementById(config.rootId);
@@ -25,6 +27,12 @@ const WorldView = (() => {
         </div>
       </div>
       <div class="world-status"></div>
+      <div class="world-stage">
+        <div class="progress">
+          <div class="progress-bar"></div>
+        </div>
+        <div class="progress-text"></div>
+      </div>
       <div class="world-panel">
         <aside class="world-list">
           <div class="world-tabs">
@@ -56,6 +64,9 @@ const WorldView = (() => {
     elements = {
       root,
       status: root.querySelector(".world-status"),
+      stage: root.querySelector(".world-stage"),
+      stageBar: root.querySelector(".world-stage .progress-bar"),
+      stageText: root.querySelector(".world-stage .progress-text"),
       savePath: root.querySelector(".save-path"),
       tabs: Array.from(root.querySelectorAll(".world-tab")),
       list: root.querySelector(".world-items"),
@@ -98,7 +109,7 @@ const WorldView = (() => {
 
     if (elements.detailTextarea) {
       elements.detailTextarea.addEventListener("input", () => {
-        if (!selectedId) {
+        if (!selectedId || isLocked) {
           return;
         }
         scheduleSave(selectedId, elements.detailTextarea.value);
@@ -137,9 +148,12 @@ const WorldView = (() => {
           : "";
       }
       render();
+      startStatusPolling();
       setStatus("世界设定已加载，修改会自动保存。", false);
     } catch (error) {
       snapshot = null;
+      stopStatusPolling();
+      setLocked(false);
       if (elements.list) {
         elements.list.innerHTML = "";
       }
@@ -165,6 +179,77 @@ const WorldView = (() => {
     }
     elements.status.textContent = message;
     elements.status.classList.toggle("is-error", Boolean(isError));
+  }
+
+  function startStatusPolling() {
+    if (statusTimer) {
+      clearInterval(statusTimer);
+    }
+    statusTimer = setInterval(fetchGenerationStatus, 800);
+    fetchGenerationStatus();
+  }
+
+  function stopStatusPolling() {
+    if (statusTimer) {
+      clearInterval(statusTimer);
+      statusTimer = null;
+    }
+  }
+
+  async function fetchGenerationStatus() {
+    try {
+      const response = await fetch("/api/world/status");
+      const data = await response.json();
+      if (!data.ok) {
+        return;
+      }
+      applyGenerationStatus(data);
+    } catch (error) {
+      // Ignore polling failures.
+    }
+  }
+
+  function applyGenerationStatus(data) {
+    if (!elements.stage || !elements.stageBar || !elements.stageText) {
+      return;
+    }
+    const status = data.status || "idle";
+    const phase = data.phase || "";
+    const running = status === "running";
+    const showStage = running && phase === "micro";
+    if (showStage) {
+      const total = data.stage_total || data.micro_total || 0;
+      const completed = data.stage_completed || 0;
+      const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+      elements.stage.classList.add("is-active");
+      elements.stageBar.style.width = `${percent}%`;
+      elements.stageText.textContent = `第二阶段进度 ${completed}/${total} (${percent}%)`;
+    } else {
+      elements.stage.classList.remove("is-active");
+      elements.stageBar.style.width = "0%";
+      elements.stageText.textContent = "";
+    }
+    setLocked(running && phase !== "done");
+  }
+
+  function setLocked(locked) {
+    if (isLocked === locked) {
+      return;
+    }
+    isLocked = locked;
+    if (elements.root) {
+      elements.root.classList.toggle("is-locked", locked);
+    }
+    if (elements.detailTextarea) {
+      elements.detailTextarea.disabled = locked;
+    }
+    if (elements.detailToggle) {
+      elements.detailToggle.disabled = locked;
+    }
+    if (locked && isEditing) {
+      isEditing = false;
+    }
+    updateDetailMode();
   }
 
   function setActiveTab(tab) {
@@ -363,7 +448,7 @@ const WorldView = (() => {
   }
 
   function setEditing(next) {
-    if (!selectedId) {
+    if (!selectedId || isLocked) {
       return;
     }
     isEditing = Boolean(next);
@@ -382,10 +467,12 @@ const WorldView = (() => {
     if (!elements.detailPreview || !elements.detailTextarea || !elements.detailToggle) {
       return;
     }
-    const showEditor = isEditing && Boolean(selectedId);
+    const showEditor = isEditing && Boolean(selectedId) && !isLocked;
     elements.detailPreview.style.display = showEditor ? "none" : "block";
     elements.detailTextarea.style.display = showEditor ? "block" : "none";
     elements.detailToggle.textContent = showEditor ? "预览" : "编辑";
+    elements.detailTextarea.disabled = isLocked;
+    elements.detailToggle.disabled = isLocked;
   }
 
   function updatePreview(value) {
@@ -538,6 +625,9 @@ const WorldView = (() => {
   }
 
   function scheduleSave(nodeId, value) {
+    if (isLocked) {
+      return;
+    }
     if (pendingSaves.has(nodeId)) {
       clearTimeout(pendingSaves.get(nodeId));
     }

@@ -28,6 +28,7 @@ const characterProgressText = document.getElementById("character-progress-text")
 let pollTimer = null;
 let characterPollTimer = null;
 let latestWorldSavePath = "";
+let worldStageReady = false;
 
 function showScreen(name) {
   Object.entries(screens).forEach(([key, node]) => {
@@ -101,6 +102,7 @@ async function startGeneration() {
     if (!data.ok) {
       throw new Error(data.error || "生成失败");
     }
+    worldStageReady = false;
     pollProgress(data.job_id, data.total);
   } catch (error) {
     setProgressMessage(`生成失败：${error.message}`);
@@ -122,6 +124,19 @@ function pollProgress(jobId, total) {
         throw new Error(data.error || "进度获取失败");
       }
       setProgress(data.completed, data.total);
+      if (data.message) {
+        setProgressMessage(data.message);
+      }
+      if ((data.ready || data.phase === "micro") && !worldStageReady) {
+        worldStageReady = true;
+        if (data.save_path) {
+          latestWorldSavePath = data.save_path;
+        }
+        if (window.WorldView) {
+          await window.WorldView.load();
+        }
+        showScreen("character");
+      }
       if (data.status === "error") {
         clearInterval(pollTimer);
         setProgressMessage(`生成失败：${data.message}`);
@@ -139,7 +154,9 @@ function pollProgress(jobId, total) {
         if (window.WorldView) {
           await window.WorldView.load();
         }
-        showScreen("character");
+        if (!worldStageReady) {
+          showScreen("character");
+        }
         generateBtn.disabled = false;
         importBtn.disabled = false;
       }
@@ -289,6 +306,8 @@ function pollCharacterProgress(jobId, total) {
       if (data.message) {
         setCharacterMessage(data.message);
       }
+      const doneTotal = data.total || total || 1;
+      const isDone = data.status === "done" || (data.completed >= doneTotal && doneTotal > 0);
       if (data.status === "error") {
         clearInterval(characterPollTimer);
         setCharacterMessage(`生成失败：${data.message}`);
@@ -298,14 +317,16 @@ function pollCharacterProgress(jobId, total) {
         }
         return;
       }
-      if (data.status === "done") {
+      if (isDone) {
         clearInterval(characterPollTimer);
-        setCharacterProgress(data.total, data.total);
+        setCharacterProgress(doneTotal, doneTotal);
         setCharacterMessage(data.message || "生成完成。");
         characterGenerateBtn.disabled = false;
         if (characterRefreshBtn) {
           characterRefreshBtn.disabled = false;
         }
+        showScreen("app");
+        showPage("character");
       }
     } catch (error) {
       clearInterval(characterPollTimer);

@@ -143,6 +143,13 @@ class GenerationJob:
     status: str = "running"
     message: str = ""
     save_path: Optional[str] = None
+    kind: str = "world"
+    phase: str = ""
+    macro_total: int = 0
+    micro_total: int = 0
+    stage_completed: int = 0
+    stage_total: int = 0
+    ready: bool = False
 
 
 class AppState:
@@ -151,6 +158,7 @@ class AppState:
         self.snapshot: Optional[Dict[str, Dict[str, Any]]] = None
         self.current_save: Optional[Path] = None
         self.jobs: Dict[str, GenerationJob] = {}
+        self.world_job_id: Optional[str] = None
 
 
 STATE = AppState()
@@ -188,6 +196,27 @@ class RequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "no_snapshot"}, status=404)
                 return
             self._send_json({"ok": True, "snapshot": snapshot, "save_path": save_path})
+            return
+        if parsed.path == "/api/world/status":
+            with STATE.lock:
+                job_id = STATE.world_job_id
+                job = STATE.jobs.get(job_id) if job_id else None
+            if not job:
+                self._send_json({"ok": True, "status": "idle"})
+                return
+            payload = {
+                "ok": True,
+                "status": job.status,
+                "message": job.message,
+                "save_path": job.save_path,
+                "phase": job.phase,
+                "macro_total": job.macro_total,
+                "micro_total": job.micro_total,
+                "stage_completed": job.stage_completed,
+                "stage_total": job.stage_total,
+                "ready": job.ready,
+            }
+            self._send_json(payload)
             return
         if parsed.path == "/api/world/snapshots":
             snapshots = _list_world_snapshots()
@@ -235,16 +264,22 @@ class RequestHandler(SimpleHTTPRequestHandler):
             if not job:
                 self._send_json({"ok": False, "error": "job_not_found"}, status=404)
                 return
-            self._send_json(
-                {
-                    "ok": True,
-                    "status": job.status,
-                    "total": job.total,
-                    "completed": job.completed,
-                    "message": job.message,
-                    "save_path": job.save_path,
-                }
-            )
+            payload = {
+                "ok": True,
+                "status": job.status,
+                "total": job.total,
+                "completed": job.completed,
+                "message": job.message,
+                "save_path": job.save_path,
+                "kind": job.kind,
+                "phase": job.phase,
+                "macro_total": job.macro_total,
+                "micro_total": job.micro_total,
+                "stage_completed": job.stage_completed,
+                "stage_total": job.stage_total,
+                "ready": job.ready,
+            }
+            self._send_json(payload)
             return
 
         self.send_error(404, "Not found")
@@ -280,30 +315,74 @@ class RequestHandler(SimpleHTTPRequestHandler):
             return
 
         job_id = uuid.uuid4().hex
-        job = GenerationJob(job_id=job_id, total=0)
+        job = GenerationJob(job_id=job_id, total=0, kind="world", phase="macro")
         with STATE.lock:
             STATE.jobs[job_id] = job
-
-        def progress_cb(node, completed: int, total: int) -> None:
-            with STATE.lock:
-                job.completed = completed
-                job.total = total
+            STATE.world_job_id = job_id
 
         def worker() -> None:
+            save_path = SAVE_ROOT / f"world_{_timestamp()}.json"
+            stage_one_saved = False
+
+            def finalize_stage_one() -> None:
+                nonlocal stage_one_saved
+                if stage_one_saved:
+                    return
+                stage_one_saved = True
+                snapshot = engine.as_dict()
+                micro_total = len(engine._iter_micro_nodes())
+                _write_snapshot(snapshot, save_path)
+                with STATE.lock:
+                    job.ready = True
+                    job.phase = "micro"
+                    job.micro_total = micro_total
+                    job.stage_total = micro_total
+                    job.stage_completed = 0
+                    job.message = "第一阶段完成，生成细节中..."
+                    job.save_path = str(save_path)
+                    STATE.snapshot = snapshot
+                    STATE.current_save = save_path
+
+            def progress_cb(node, completed: int, total: int) -> None:
+                with STATE.lock:
+                    job.completed = completed
+                    job.total = total
+                    if job.phase == "micro":
+                        job.stage_completed = max(0, completed - job.macro_total)
+                    else:
+                        job.stage_total = job.macro_total or total
+                        job.stage_completed = completed
+
             try:
                 engine = WorldEngine(
                     world_spec_path=str(WORLD_SPEC),
                     user_pitch=prompt,
-                    auto_generate=True,
+                    auto_generate=False,
+                )
+                macro_total = len(engine._iter_macro_nodes())
+                with STATE.lock:
+                    job.macro_total = macro_total
+                    job.stage_total = macro_total
+                original_generate_micro_structure = engine._generate_micro_structure
+
+                def wrapped_generate_micro_structure(*args, **kwargs):
+                    original_generate_micro_structure(*args, **kwargs)
+                    finalize_stage_one()
+
+                engine._generate_micro_structure = wrapped_generate_micro_structure
+                engine.generate_world(
+                    prompt,
                     progress_callback=progress_cb,
                 )
-                save_path = SAVE_ROOT / f"world_{_timestamp()}.json"
-                engine.save_snapshot(save_path)
                 snapshot = engine.as_dict()
+                _write_snapshot(snapshot, save_path)
                 with STATE.lock:
                     job.status = "done"
                     job.completed = job.total
                     job.save_path = str(save_path)
+                    job.phase = "done"
+                    job.ready = True
+                    job.message = "生成完成"
                     STATE.snapshot = snapshot
                     STATE.current_save = save_path
             except Exception as exc:
@@ -338,7 +417,10 @@ class RequestHandler(SimpleHTTPRequestHandler):
 
         job_id = uuid.uuid4().hex
         job = GenerationJob(
-            job_id=job_id, total=total + 2, message="准备生成角色"
+            job_id=job_id,
+            total=total + 2,
+            message="准备生成角色",
+            kind="character",
         )
         with STATE.lock:
             STATE.jobs[job_id] = job
@@ -401,8 +483,12 @@ class RequestHandler(SimpleHTTPRequestHandler):
             return
 
         snapshot = _normalize_snapshot(data)
-        safe_name = _sanitize_filename(Path(filename).stem)
-        save_path = SAVE_ROOT / f"{safe_name}_{_timestamp()}.json"
+        raw_name = Path(filename).name
+        safe_name = _sanitize_filename(raw_name)
+        if not safe_name.lower().endswith(".json"):
+            safe_name = f"{safe_name}.json"
+        candidate_paths = [SAVE_ROOT / "world" / safe_name, SAVE_ROOT / safe_name]
+        save_path = next((path for path in candidate_paths if path.exists()), candidate_paths[-1])
         with STATE.lock:
             _write_snapshot(snapshot, save_path)
             STATE.snapshot = snapshot
@@ -421,6 +507,21 @@ class RequestHandler(SimpleHTTPRequestHandler):
             return
 
         with STATE.lock:
+            world_job = (
+                STATE.jobs.get(STATE.world_job_id)
+                if STATE.world_job_id
+                else None
+            )
+            if (
+                world_job
+                and world_job.kind == "world"
+                and world_job.status == "running"
+            ):
+                self._send_json(
+                    {"ok": False, "error": "world_generation_running"},
+                    status=409,
+                )
+                return
             if not STATE.snapshot:
                 self._send_json({"ok": False, "error": "no_snapshot"}, status=404)
                 return
