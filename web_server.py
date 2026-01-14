@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -17,6 +18,42 @@ BASE_DIR = Path(__file__).resolve().parent
 WEB_ROOT = BASE_DIR / "web"
 SAVE_ROOT = BASE_DIR / "save"
 WORLD_SPEC = BASE_DIR / "world" / "world_spec.md"
+DEFAULT_LOG_PATH = Path("log") / "web_server.log"
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger("web_server")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+def _truncate_text(text: str, limit: int = 2000) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
+
+
+LOGGER = _get_logger()
+
+
+def _sanitize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, str):
+            sanitized[key] = _truncate_text(value)
+        else:
+            sanitized[key] = value
+    return sanitized
 
 
 def _timestamp() -> str:
@@ -167,25 +204,94 @@ STATE = AppState()
 class RequestHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
+        self.logger = LOGGER
+        self._request_payload: Optional[Dict[str, Any]] = None
+        self._request_raw: str = ""
+        self._request_error_detail: str = ""
 
     def log_message(self, format: str, *args) -> None:
         return
 
-    def do_GET(self) -> None:
+    def _reset_request_context(self) -> None:
+        self._request_payload = None
+        self._request_raw = ""
+        self._request_error_detail = ""
+
+    def _build_request_context(self) -> Dict[str, Any]:
         parsed = urlparse(self.path)
-        if parsed.path.startswith("/api/"):
-            self._handle_api_get(parsed)
-            return
-        if parsed.path == "/":
-            self.path = "/index.html"
-        super().do_GET()
+        context = {
+            "method": self.command,
+            "path": parsed.path,
+            "query": parsed.query,
+            "client": self.client_address[0] if self.client_address else "",
+            "headers": {
+                "Content-Type": self.headers.get("Content-Type", ""),
+                "User-Agent": self.headers.get("User-Agent", ""),
+            },
+        }
+        if self._request_error_detail:
+            context["error_detail"] = self._request_error_detail
+        if self._request_payload is not None:
+            context["request_payload"] = _sanitize_payload(self._request_payload)
+        elif self._request_raw:
+            context["request_raw"] = _truncate_text(self._request_raw)
+        return context
+
+    def _log_api_error(self, payload: Dict[str, Any], status: int) -> None:
+        context = self._build_request_context()
+        context["response_status"] = status
+        context["response"] = payload
+        detail = json.dumps(context, ensure_ascii=False)
+        level = logging.ERROR if status >= 500 else logging.WARNING
+        self.logger.log(level, "api_error %s", detail)
+
+    def do_GET(self) -> None:
+        self._reset_request_context()
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/"):
+                self._handle_api_get(parsed)
+                return
+            if parsed.path == "/":
+                self.path = "/index.html"
+            super().do_GET()
+        except Exception:
+            self.logger.exception("unhandled GET error path=%s", self.path)
+            if self.path.startswith("/api/"):
+                try:
+                    self._send_json(
+                        {"ok": False, "error": "internal_server_error"}, status=500
+                    )
+                except Exception:
+                    return
+            else:
+                try:
+                    self.send_error(500, "Internal server error")
+                except Exception:
+                    return
 
     def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path.startswith("/api/"):
-            self._handle_api_post(parsed)
-            return
-        self.send_error(404, "Not found")
+        self._reset_request_context()
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/"):
+                self._handle_api_post(parsed)
+                return
+            self.send_error(404, "Not found")
+        except Exception:
+            self.logger.exception("unhandled POST error path=%s", self.path)
+            if self.path.startswith("/api/"):
+                try:
+                    self._send_json(
+                        {"ok": False, "error": "internal_server_error"}, status=500
+                    )
+                except Exception:
+                    return
+            else:
+                try:
+                    self.send_error(500, "Internal server error")
+                except Exception:
+                    return
 
     def _handle_api_get(self, parsed) -> None:
         if parsed.path == "/api/world":
@@ -287,11 +393,14 @@ class RequestHandler(SimpleHTTPRequestHandler):
     def _handle_api_post(self, parsed) -> None:
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
+        self._request_raw = raw.decode("utf-8", errors="replace") if raw else ""
         try:
-            payload = json.loads(raw.decode("utf-8")) if raw else {}
-        except json.JSONDecodeError:
+            payload = json.loads(self._request_raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            self._request_error_detail = f"json_decode_error: {exc}"
             self._send_json({"ok": False, "error": "invalid_json"}, status=400)
             return
+        self._request_payload = payload
 
         if parsed.path == "/api/generate":
             self._handle_generate(payload)
@@ -386,6 +495,12 @@ class RequestHandler(SimpleHTTPRequestHandler):
                     STATE.snapshot = snapshot
                     STATE.current_save = save_path
             except Exception as exc:
+                self.logger.exception(
+                    "generate_world failed job_id=%s prompt_len=%s save_path=%s",
+                    job_id,
+                    len(prompt),
+                    save_path,
+                )
                 with STATE.lock:
                     job.status = "error"
                     job.message = str(exc)
@@ -459,6 +574,12 @@ class RequestHandler(SimpleHTTPRequestHandler):
                         f"/ 地点关系 {len(location_edges)}"
                     )
             except Exception as exc:
+                self.logger.exception(
+                    "generate_characters failed job_id=%s total=%s snapshot_path=%s",
+                    job_id,
+                    total,
+                    snapshot_path,
+                )
                 with STATE.lock:
                     job.status = "error"
                     job.message = str(exc)
@@ -536,6 +657,8 @@ class RequestHandler(SimpleHTTPRequestHandler):
         self._send_json({"ok": True})
 
     def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
+        if status >= 400 or (isinstance(payload, dict) and payload.get("ok") is False):
+            self._log_api_error(payload, status)
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")

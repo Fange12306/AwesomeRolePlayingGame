@@ -1,4 +1,5 @@
 import os
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -55,7 +56,14 @@ class LLMClient:
             return output
         except Exception as e:
             error_text = f"Error in chat_once: {str(e)}"
-            self._log_llm_call(messages, error_text, label=log_label, error=True)
+            error_detail = traceback.format_exc()
+            self._log_llm_call(
+                messages,
+                error_text,
+                label=log_label,
+                error=True,
+                error_detail=error_detail,
+            )
             return error_text
 
     def chat_multi_turn(
@@ -79,7 +87,14 @@ class LLMClient:
             return output
         except Exception as e:
             error_text = f"Error in chat_multi_turn: {str(e)}"
-            self._log_llm_call(messages, error_text, label=log_label, error=True)
+            error_detail = traceback.format_exc()
+            self._log_llm_call(
+                messages,
+                error_text,
+                label=log_label,
+                error=True,
+                error_detail=error_detail,
+            )
             return error_text
 
     def _log_llm_call(
@@ -88,6 +103,7 @@ class LLMClient:
         output: str,
         label: Optional[str] = None,
         error: bool = False,
+        error_detail: Optional[str] = None,
     ) -> None:
         try:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,6 +113,9 @@ class LLMClient:
                 lines.append(f"TYPE: {label}")
             if error:
                 lines.append("STATUS: error")
+                if error_detail:
+                    lines.append("TRACEBACK:")
+                    lines.append(str(error_detail).rstrip())
             lines.append("MESSAGES:")
             for message in messages:
                 role = str(message.get("role", "unknown")).upper()

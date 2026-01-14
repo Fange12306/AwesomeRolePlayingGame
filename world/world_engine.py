@@ -16,6 +16,13 @@ from world.world_prompt import (
 
 DEFAULT_SPEC_PATH = Path(__file__).resolve().parent / "world_spec.md"
 DEFAULT_LOG_PATH = Path("log") / "world_engine.log"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(message)s"
+
+
+def _truncate_text(text: str, limit: int = 800) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
 
 
 def _get_logger() -> logging.Logger:
@@ -25,7 +32,7 @@ def _get_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
     DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    formatter = logging.Formatter(LOG_FORMAT)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.propagate = False
@@ -76,7 +83,15 @@ class WorldEngine:
             "macro": self.macro,
             "micro": self.micro,
         }
-        self.llm_client = llm_client or LLMClient()
+        try:
+            self.llm_client = llm_client or LLMClient()
+        except Exception:
+            self.logger.exception(
+                "init world_engine llm_client failed world_spec_path=%s user_pitch_len=%s",
+                self.world_spec_path,
+                len(user_pitch or ""),
+            )
+            raise
         self.user_pitch = user_pitch or ""
         self.max_retries = max_retries
         self.macro_summary = ""
@@ -156,131 +171,153 @@ class WorldEngine:
         self.user_pitch = user_pitch
         self.root.value = user_pitch
         retries = max_retries if max_retries is not None else self.max_retries
-        self.logger.info(
-            "generate_world start regenerate=%s retries=%s pitch_len=%s",
-            regenerate,
-            retries,
-            len(user_pitch),
-        )
+        try:
+            self.logger.info(
+                "generate_world start regenerate=%s retries=%s pitch_len=%s",
+                regenerate,
+                retries,
+                len(user_pitch),
+            )
 
-        generated: Dict[str, str] = {}
-        completed = 0
+            generated: Dict[str, str] = {}
+            completed = 0
 
-        macro_nodes = self._iter_macro_nodes()
-        macro_total = len(macro_nodes)
-        for node in macro_nodes:
-            if node.value.strip() and not regenerate:
+            macro_nodes = self._iter_macro_nodes()
+            macro_total = len(macro_nodes)
+            for node in macro_nodes:
+                if node.value.strip() and not regenerate:
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(node, completed, macro_total)
+                    continue
+                parent_value = node.parent.value if node.parent else ""
+                prompt = WorldPromptBuilder.build_macro_prompt(
+                    user_pitch=user_pitch,
+                    node_identifier=node.identifier,
+                    node_key=node.key,
+                    hint=self.spec_hints.get(node.identifier, ""),
+                    parent_value=parent_value,
+                )
+                node.value = self._generate_text_with_retry(
+                    prompt,
+                    system_prompt=WorldPromptBuilder.system_prompt(),
+                    log_label=f"MACRO_{node.identifier}",
+                    max_retries=retries,
+                )
+                generated[node.identifier] = node.value
                 completed += 1
                 if progress_callback:
                     progress_callback(node, completed, macro_total)
-                continue
-            parent_value = node.parent.value if node.parent else ""
-            prompt = WorldPromptBuilder.build_macro_prompt(
-                user_pitch=user_pitch,
-                node_identifier=node.identifier,
-                node_key=node.key,
-                hint=self.spec_hints.get(node.identifier, ""),
-                parent_value=parent_value,
+
+            if not self.macro_summary or regenerate:
+                self.macro_summary = self._generate_macro_summary(retries=retries)
+
+            self._generate_micro_structure(
+                macro_summary=self.macro_summary,
+                retries=retries,
             )
-            node.value = self._generate_text_with_retry(
-                prompt,
-                system_prompt=WorldPromptBuilder.system_prompt(),
-                log_label=f"MACRO_{node.identifier}",
-                max_retries=retries,
+
+            micro_nodes = self._iter_micro_nodes()
+            self.logger.info(
+                "generate_world macro_total=%s micro_total=%s",
+                macro_total,
+                len(micro_nodes),
             )
-            generated[node.identifier] = node.value
-            completed += 1
-            if progress_callback:
-                progress_callback(node, completed, macro_total)
-
-        if not self.macro_summary or regenerate:
-            self.macro_summary = self._generate_macro_summary(retries=retries)
-
-        self._generate_micro_structure(
-            macro_summary=self.macro_summary,
-            retries=retries,
-        )
-
-        micro_nodes = self._iter_micro_nodes()
-        self.logger.info(
-            "generate_world macro_total=%s micro_total=%s",
-            macro_total,
-            len(micro_nodes),
-        )
-        total = len(macro_nodes) + len(micro_nodes)
-        for node in micro_nodes:
-            if node.value.strip() and not regenerate:
+            total = len(macro_nodes) + len(micro_nodes)
+            for node in micro_nodes:
+                if node.value.strip() and not regenerate:
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(node, completed, total)
+                    continue
+                prompt = self._build_micro_value_prompt(node)
+                node.value = self._generate_text_with_retry(
+                    prompt,
+                    system_prompt=WorldPromptBuilder.system_prompt(),
+                    log_label=f"MICRO_VALUE_{node.identifier}",
+                    max_retries=retries,
+                )
+                generated[node.identifier] = node.value
                 completed += 1
                 if progress_callback:
                     progress_callback(node, completed, total)
-                continue
-            prompt = self._build_micro_value_prompt(node)
-            node.value = self._generate_text_with_retry(
-                prompt,
-                system_prompt=WorldPromptBuilder.system_prompt(),
-                log_label=f"MICRO_VALUE_{node.identifier}",
-                max_retries=retries,
-            )
-            generated[node.identifier] = node.value
-            completed += 1
-            if progress_callback:
-                progress_callback(node, completed, total)
 
-        self.logger.info(
-            "generate_world done generated=%s total=%s",
-            len(generated),
-            total,
-        )
-        return generated
+            self.logger.info(
+                "generate_world done generated=%s total=%s",
+                len(generated),
+                total,
+            )
+            return generated
+        except Exception:
+            self.logger.exception(
+                "generate_world failed regenerate=%s retries=%s pitch_len=%s",
+                regenerate,
+                retries,
+                len(user_pitch),
+            )
+            raise
 
     def save_snapshot(self, output_path: str | Path) -> None:
         path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = self.as_dict()
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        self.logger.info("save_snapshot path=%s nodes=%s", path, len(payload))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = self.as_dict()
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            self.logger.info("save_snapshot path=%s nodes=%s", path, len(payload))
+        except Exception:
+            self.logger.exception("save_snapshot failed path=%s", path)
+            raise
 
     def apply_snapshot(self, snapshot: Dict[str, Dict[str, str]]) -> None:
-        for identifier, node_data in snapshot.items():
-            key = (
-                str(node_data.get("key", ""))
-                or str(node_data.get("title", ""))
-                or identifier
-            )
-            value = str(node_data.get("value", ""))
+        try:
+            for identifier, node_data in snapshot.items():
+                key = (
+                    str(node_data.get("key", ""))
+                    or str(node_data.get("title", ""))
+                    or identifier
+                )
+                value = str(node_data.get("value", ""))
 
-            if identifier == "world":
-                self.root.key = key
-                self.root.value = value
-                self.user_pitch = value
-                continue
-            if identifier == "macro":
-                self.macro.key = key
-                self.macro.value = value
-                continue
-            if identifier == "micro":
-                self.micro.key = key
-                self.micro.value = value
-                continue
+                if identifier == "world":
+                    self.root.key = key
+                    self.root.value = value
+                    self.user_pitch = value
+                    continue
+                if identifier == "macro":
+                    self.macro.key = key
+                    self.macro.value = value
+                    continue
+                if identifier == "micro":
+                    self.micro.key = key
+                    self.micro.value = value
+                    continue
 
-            if identifier in self.nodes:
-                node = self.nodes[identifier]
-                node.key = key
-                node.value = value
-            else:
-                node = self.add_node(identifier, key)
-                node.value = value
-        self.logger.info("apply_snapshot nodes=%s", len(snapshot))
+                if identifier in self.nodes:
+                    node = self.nodes[identifier]
+                    node.key = key
+                    node.value = value
+                else:
+                    node = self.add_node(identifier, key)
+                    node.value = value
+            self.logger.info("apply_snapshot nodes=%s", len(snapshot))
+        except Exception:
+            self.logger.exception("apply_snapshot failed nodes=%s", len(snapshot))
+            raise
 
     @classmethod
     def from_snapshot(
         cls, snapshot_path: str | Path, llm_client: Optional[LLMClient] = None
     ) -> "WorldEngine":
         path = Path(snapshot_path)
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger = _get_logger()
+            logger.exception("from_snapshot read failed path=%s", path)
+            raise
         engine = cls(world_spec_path=None, llm_client=llm_client, auto_generate=False)
         engine.apply_snapshot(payload)
         engine.logger.info("from_snapshot path=%s nodes=%s", path, len(payload))
@@ -399,6 +436,13 @@ class WorldEngine:
                 return self._parse_name_list(response)
             except ValueError as exc:
                 last_error = str(exc)
+                self.logger.warning(
+                    "parse_name_list failed label=%s attempt=%s error=%s response=%s",
+                    log_label,
+                    attempt,
+                    last_error,
+                    _truncate_text(response),
+                )
                 continue
         raise ValueError(f"Unable to parse name list for {log_label}: {last_error}")
 
@@ -578,11 +622,19 @@ class WorldEngine:
         label = log_label or ""
         self.logger.info("LLM_INPUT label=%s system=%s", label, system_prompt)
         self.logger.info("LLM_INPUT label=%s prompt=%s", label, prompt)
-        output = self.llm_client.chat_once(
-            prompt,
-            system_prompt=system_prompt,
-            log_label=log_label,
-        )
+        try:
+            output = self.llm_client.chat_once(
+                prompt,
+                system_prompt=system_prompt,
+                log_label=log_label,
+            )
+        except Exception:
+            self.logger.exception(
+                "LLM call failed label=%s prompt_len=%s", label, len(prompt)
+            )
+            raise
+        if output.startswith("Error in chat_"):
+            self.logger.error("LLM error output label=%s output=%s", label, output)
         self.logger.info("LLM_OUTPUT label=%s output=%s", label, output)
         return output
 

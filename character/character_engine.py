@@ -16,6 +16,13 @@ from character.character_prompt import (
 )
 
 DEFAULT_LOG_PATH = Path("log") / "character_engine.log"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(message)s"
+
+
+def _truncate_text(text: str, limit: int = 800) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
 
 
 def _get_logger() -> logging.Logger:
@@ -25,7 +32,7 @@ def _get_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
     DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    formatter = logging.Formatter(LOG_FORMAT)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.propagate = False
@@ -81,7 +88,15 @@ class CharacterEngine:
         self.logger = _get_logger()
         self.world_snapshot_path = Path(world_snapshot_path) if world_snapshot_path else None
         self.world_snapshot = self._load_world_snapshot(world_snapshot)
-        self.llm_client = llm_client or LLMClient()
+        try:
+            self.llm_client = llm_client or LLMClient()
+        except Exception:
+            self.logger.exception(
+                "init character_engine llm_client failed snapshot_path=%s snapshot_nodes=%s",
+                self.world_snapshot_path,
+                len(self.world_snapshot),
+            )
+            raise
         self.records: List[CharacterRecord] = []
         self.relations: List[Dict[str, object]] = []
         self.location_edges: List[Dict[str, object]] = []
@@ -179,94 +194,117 @@ class CharacterEngine:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         max_retries: int = 1,
     ) -> List[CharacterRecord]:
-        self.logger.info(
-            "generate_characters start total=%s regenerate=%s retries=%s pitch_len=%s",
-            request.total,
-            regenerate,
-            max_retries,
-            len(request.pitch),
-        )
-        if self.records and not regenerate:
-            if progress_callback:
-                progress_callback(len(self.records), len(self.records))
-            self.logger.info("generate_characters reuse count=%s", len(self.records))
-            return self.records
-
-        mount_points = self.extract_mount_points()
-        mount_lookup = {
-            (mount.region_id, mount.polity_id): mount for mount in mount_points
-        }
-        world_outline = self._build_world_outline()
-        blueprints = self.build_blueprints(request, mount_points)
-
-        records: List[CharacterRecord] = []
-        total = len(blueprints)
-        completed = 0
-        for blueprint in blueprints:
-            mount_key = (blueprint.region_id, blueprint.polity_id)
-            mount_point = mount_lookup.get(mount_key)
-            prompt = CharacterPromptBuilder.build_prompt(
-                world_outline,
-                blueprint,
-                mount_point=mount_point,
-                character_pitch=request.pitch,
+        try:
+            self.logger.info(
+                "generate_characters start total=%s regenerate=%s retries=%s pitch_len=%s",
+                request.total,
+                regenerate,
+                max_retries,
+                len(request.pitch),
             )
-            profile = self._generate_profile_with_retry(
-                prompt, max_retries=max_retries
-            )
-            record = CharacterRecord(
-                identifier=blueprint.identifier,
-                region_id=blueprint.region_id,
-                polity_id=blueprint.polity_id,
-                profile=profile,
-            )
-            records.append(record)
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, total)
+            if self.records and not regenerate:
+                if progress_callback:
+                    progress_callback(len(self.records), len(self.records))
+                self.logger.info("generate_characters reuse count=%s", len(self.records))
+                return self.records
 
-        self.records = records
-        self.logger.info("generate_characters done count=%s", len(records))
-        return records
+            mount_points = self.extract_mount_points()
+            mount_lookup = {
+                (mount.region_id, mount.polity_id): mount for mount in mount_points
+            }
+            world_outline = self._build_world_outline()
+            blueprints = self.build_blueprints(request, mount_points)
+
+            records: List[CharacterRecord] = []
+            total = len(blueprints)
+            completed = 0
+            for blueprint in blueprints:
+                mount_key = (blueprint.region_id, blueprint.polity_id)
+                mount_point = mount_lookup.get(mount_key)
+                prompt = CharacterPromptBuilder.build_prompt(
+                    world_outline,
+                    blueprint,
+                    mount_point=mount_point,
+                    character_pitch=request.pitch,
+                )
+                profile = self._generate_profile_with_retry(
+                    prompt, max_retries=max_retries
+                )
+                record = CharacterRecord(
+                    identifier=blueprint.identifier,
+                    region_id=blueprint.region_id,
+                    polity_id=blueprint.polity_id,
+                    profile=profile,
+                )
+                records.append(record)
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, total)
+
+            self.records = records
+            self.logger.info("generate_characters done count=%s", len(records))
+            return records
+        except Exception:
+            self.logger.exception(
+                "generate_characters failed total=%s regenerate=%s pitch_len=%s",
+                request.total,
+                regenerate,
+                len(request.pitch),
+            )
+            raise
 
     def generate_relations(
         self, records: Optional[List[CharacterRecord]] = None
     ) -> List[Dict[str, object]]:
-        records = records or self.records
-        if not records:
-            return []
+        try:
+            records = records or self.records
+            if not records:
+                return []
 
-        character_lines = [self._summarize_character(record) for record in records]
-        prompt = RelationPromptBuilder.build_prompt(character_lines)
-        output = self._chat_once(
-            prompt,
-            system_prompt=RelationPromptBuilder.system_prompt(),
-            log_label="RELATION",
-        )
-        relations = self._parse_relations(output)
-        self.relations = relations
-        self.logger.info("generate_relations count=%s", len(relations))
-        return relations
+            character_lines = [self._summarize_character(record) for record in records]
+            prompt = RelationPromptBuilder.build_prompt(character_lines)
+            output = self._chat_once(
+                prompt,
+                system_prompt=RelationPromptBuilder.system_prompt(),
+                log_label="RELATION",
+            )
+            relations = self._parse_relations(output)
+            self.relations = relations
+            self.logger.info("generate_relations count=%s", len(relations))
+            return relations
+        except Exception:
+            self.logger.exception(
+                "generate_relations failed records=%s", len(records or [])
+            )
+            raise
 
     def save_snapshot(
         self, output_path: str | Path, records: Optional[List[CharacterRecord]] = None
     ) -> None:
         path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "generated_at": datetime.now().isoformat(timespec="seconds"),
-            "world_snapshot_path": str(self.world_snapshot_path)
-            if self.world_snapshot_path
-            else "",
-            "characters": [record.to_dict() for record in (records or self.records)],
-            "relations": self.relations,
-            "character_location_edges": self.location_edges,
-        }
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        self.logger.info("save_snapshot path=%s characters=%s", path, len(payload["characters"]))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "world_snapshot_path": str(self.world_snapshot_path)
+                if self.world_snapshot_path
+                else "",
+                "characters": [record.to_dict() for record in (records or self.records)],
+                "relations": self.relations,
+                "character_location_edges": self.location_edges,
+            }
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            self.logger.info(
+                "save_snapshot path=%s characters=%s",
+                path,
+                len(payload["characters"]),
+            )
+        except Exception:
+            self.logger.exception("save_snapshot failed path=%s", path)
+            raise
 
     def _load_world_snapshot(
         self, override: Optional[Dict[str, Dict[str, object]]]
@@ -274,7 +312,13 @@ class CharacterEngine:
         if override is not None:
             return override
         if self.world_snapshot_path and self.world_snapshot_path.exists():
-            return json.loads(self.world_snapshot_path.read_text(encoding="utf-8"))
+            try:
+                return json.loads(self.world_snapshot_path.read_text(encoding="utf-8"))
+            except Exception:
+                self.logger.exception(
+                    "load_world_snapshot failed path=%s", self.world_snapshot_path
+                )
+                raise
         return {}
 
     def _build_world_outline(self) -> str:
@@ -325,11 +369,19 @@ class CharacterEngine:
         label = log_label or ""
         self.logger.info("LLM_INPUT label=%s system=%s", label, system_prompt)
         self.logger.info("LLM_INPUT label=%s prompt=%s", label, prompt)
-        output = self.llm_client.chat_once(
-            prompt,
-            system_prompt=system_prompt,
-            log_label=log_label,
-        )
+        try:
+            output = self.llm_client.chat_once(
+                prompt,
+                system_prompt=system_prompt,
+                log_label=log_label,
+            )
+        except Exception:
+            self.logger.exception(
+                "LLM call failed label=%s prompt_len=%s", label, len(prompt)
+            )
+            raise
+        if output.startswith("Error in chat_"):
+            self.logger.error("LLM error output label=%s output=%s", label, output)
         self.logger.info("LLM_OUTPUT label=%s output=%s", label, output)
         return output
 
@@ -359,45 +411,59 @@ class CharacterEngine:
             profile = self._parse_profile(output)
             if isinstance(profile, dict):
                 return profile
+        if not isinstance(profile, dict):
+            self.logger.warning(
+                "generate_profile invalid output prompt_len=%s output=%s",
+                len(prompt),
+                _truncate_text(str(profile)),
+            )
         return profile
 
     def generate_location_edges(
         self, records: Optional[List[CharacterRecord]] = None, regenerate: bool = False
     ) -> List[Dict[str, object]]:
-        if self.location_edges and not regenerate:
-            return self.location_edges
+        try:
+            if self.location_edges and not regenerate:
+                return self.location_edges
 
-        records = records or self.records
-        if not records:
-            return []
+            records = records or self.records
+            if not records:
+                return []
 
-        locations = self._collect_location_nodes()
-        location_lookup = {item["id"]: item for item in locations}
-        base_edges = self._build_rule_location_edges(records, location_lookup)
-        base_lines = [self._summarize_location_edge(edge) for edge in base_edges]
-        character_lines = [self._summarize_character(record) for record in records]
-        location_lines = [self._summarize_location(item) for item in locations]
+            locations = self._collect_location_nodes()
+            location_lookup = {item["id"]: item for item in locations}
+            base_edges = self._build_rule_location_edges(records, location_lookup)
+            base_lines = [self._summarize_location_edge(edge) for edge in base_edges]
+            character_lines = [self._summarize_character(record) for record in records]
+            location_lines = [self._summarize_location(item) for item in locations]
 
-        prompt = LocationRelationPromptBuilder.build_prompt(
-            character_lines, location_lines, base_lines
-        )
-        output = self._chat_once(
-            prompt,
-            system_prompt=LocationRelationPromptBuilder.system_prompt(),
-            log_label="LOCATION_RELATION",
-        )
-        extra_edges = self._parse_location_relations(output)
-        merged = self._merge_location_edges(
-            base_edges, extra_edges, location_lookup, {r.identifier for r in records}
-        )
-        self.location_edges = merged
-        self.logger.info(
-            "generate_location_edges base=%s extra=%s merged=%s",
-            len(base_edges),
-            len(extra_edges),
-            len(merged),
-        )
-        return merged
+            prompt = LocationRelationPromptBuilder.build_prompt(
+                character_lines, location_lines, base_lines
+            )
+            output = self._chat_once(
+                prompt,
+                system_prompt=LocationRelationPromptBuilder.system_prompt(),
+                log_label="LOCATION_RELATION",
+            )
+            extra_edges = self._parse_location_relations(output)
+            merged = self._merge_location_edges(
+                base_edges, extra_edges, location_lookup, {r.identifier for r in records}
+            )
+            self.location_edges = merged
+            self.logger.info(
+                "generate_location_edges base=%s extra=%s merged=%s",
+                len(base_edges),
+                len(extra_edges),
+                len(merged),
+            )
+            return merged
+        except Exception:
+            self.logger.exception(
+                "generate_location_edges failed records=%s regenerate=%s",
+                len(records or []),
+                regenerate,
+            )
+            raise
 
     def _collect_location_nodes(self) -> List[Dict[str, str]]:
         micro = self.world_snapshot.get("micro")
@@ -529,8 +595,12 @@ class CharacterEngine:
                     return [item for item in data if isinstance(item, dict)]
                 if isinstance(data, dict):
                     return [data]
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                self.logger.warning(
+                    "parse_location_relations invalid_json error=%s output=%s",
+                    exc,
+                    _truncate_text(output),
+                )
         return [{"raw": output.strip()}]
 
     def _merge_location_edges(
@@ -606,8 +676,12 @@ class CharacterEngine:
                     return [item for item in data if isinstance(item, dict)]
                 if isinstance(data, dict):
                     return [data]
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                self.logger.warning(
+                    "parse_relations invalid_json error=%s output=%s",
+                    exc,
+                    _truncate_text(output),
+                )
         return [{"raw": output.strip()}]
 
     def _summarize_character(self, record: CharacterRecord) -> str:

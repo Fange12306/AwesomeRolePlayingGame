@@ -13,6 +13,13 @@ from world.world_engine import WorldEngine, WorldNode
 ADD_TAG = "<|ADD_NODE|>"
 UPDATE_TAG = "<|UPDATE_NODE|>"
 DEFAULT_LOG_PATH = Path("log") / "world_agent.log"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(message)s"
+
+
+def _truncate_text(text: str, limit: int = 800) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
 
 
 def _get_logger() -> logging.Logger:
@@ -22,7 +29,7 @@ def _get_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
     DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    formatter = logging.Formatter(LOG_FORMAT)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.propagate = False
@@ -41,55 +48,83 @@ class WorldAgent:
         self, engine: WorldEngine, llm_client: Optional[LLMClient] = None
     ) -> None:
         self.engine = engine
-        self.llm_client = llm_client or engine.llm_client or LLMClient()
         self.logger = _get_logger()
+        try:
+            self.llm_client = llm_client or engine.llm_client or LLMClient()
+        except Exception:
+            self.logger.exception("init world_agent llm_client failed nodes=%s", len(engine.nodes))
+            raise
         self.logger.info("init world_agent nodes=%s", len(self.engine.nodes))
 
     def extract_info(self, query: str) -> str:
-        prompt = self._build_extract_prompt(query)
-        response = self._chat_once(
-            prompt, system_prompt=self._system_prompt(), log_label="EXTRACT"
-        )
-        identifier = self._parse_query_identifier(response)
-        if not identifier:
-            self.logger.info("extract_info miss query_len=%s", len(query))
-            return "无相关信息"
-        node = self.engine.nodes.get(identifier)
-        if not node or not node.value.strip():
-            self.logger.info("extract_info empty id=%s", identifier)
-            return "无相关信息"
-        self.logger.info(
-            "extract_info hit id=%s value_len=%s", identifier, len(node.value)
-        )
-        return node.value
+        try:
+            prompt = self._build_extract_prompt(query)
+            response = self._chat_once(
+                prompt, system_prompt=self._system_prompt(), log_label="EXTRACT"
+            )
+            identifier = self._parse_query_identifier(response)
+            if not identifier:
+                self.logger.info("extract_info miss query_len=%s", len(query))
+                return "无相关信息"
+            node = self.engine.nodes.get(identifier)
+            if not node or not node.value.strip():
+                self.logger.info("extract_info empty id=%s", identifier)
+                return "无相关信息"
+            self.logger.info(
+                "extract_info hit id=%s value_len=%s", identifier, len(node.value)
+            )
+            return node.value
+        except Exception:
+            self.logger.exception("extract_info failed query_len=%s", len(query))
+            raise
 
     def decide_action(self, update_info: str) -> ActionDecision:
-        prompt = self._build_decision_prompt(update_info)
-        response = self._chat_once(
-            prompt, system_prompt=self._system_prompt(), log_label="DECIDE"
-        )
-        flag, index = self._parse_decision(response)
-        if index not in self.engine.nodes:
-            raise ValueError(f"Node {index} not found for decision")
-        self.logger.info(
-            "decide_action flag=%s index=%s info_len=%s",
-            flag,
-            index,
-            len(update_info),
-        )
-        return ActionDecision(flag=flag, index=index, raw=response)
+        response = ""
+        try:
+            prompt = self._build_decision_prompt(update_info)
+            response = self._chat_once(
+                prompt, system_prompt=self._system_prompt(), log_label="DECIDE"
+            )
+            flag, index = self._parse_decision(response)
+            if index not in self.engine.nodes:
+                raise ValueError(f"Node {index} not found for decision")
+            self.logger.info(
+                "decide_action flag=%s index=%s info_len=%s",
+                flag,
+                index,
+                len(update_info),
+            )
+            return ActionDecision(flag=flag, index=index, raw=response)
+        except Exception:
+            self.logger.exception(
+                "decide_action failed info_len=%s response=%s",
+                len(update_info),
+                _truncate_text(response),
+            )
+            raise
 
     def apply_update(self, flag: str, index: str, update_info: str) -> WorldNode:
-        normalized = self._normalize_flag(flag)
-        if normalized == ADD_TAG:
-            node = self._apply_add(index, update_info)
-            self.logger.info("apply_update add parent=%s child=%s", index, node.identifier)
-            return node
-        if normalized == UPDATE_TAG:
-            node = self._apply_update(index, update_info)
-            self.logger.info("apply_update update index=%s", index)
-            return node
-        raise ValueError(f"Unknown flag: {flag}")
+        try:
+            normalized = self._normalize_flag(flag)
+            if normalized == ADD_TAG:
+                node = self._apply_add(index, update_info)
+                self.logger.info(
+                    "apply_update add parent=%s child=%s", index, node.identifier
+                )
+                return node
+            if normalized == UPDATE_TAG:
+                node = self._apply_update(index, update_info)
+                self.logger.info("apply_update update index=%s", index)
+                return node
+            raise ValueError(f"Unknown flag: {flag}")
+        except Exception:
+            self.logger.exception(
+                "apply_update failed flag=%s index=%s info_len=%s",
+                flag,
+                index,
+                len(update_info),
+            )
+            raise
 
     # Prompt builders -----------------------------------------------------
     def _build_extract_prompt(self, query: str) -> str:
@@ -322,10 +357,18 @@ class WorldAgent:
         label = log_label or ""
         self.logger.info("LLM_INPUT label=%s system=%s", label, system_prompt)
         self.logger.info("LLM_INPUT label=%s prompt=%s", label, prompt)
-        output = self.llm_client.chat_once(
-            prompt,
-            system_prompt=system_prompt,
-            log_label=log_label,
-        )
+        try:
+            output = self.llm_client.chat_once(
+                prompt,
+                system_prompt=system_prompt,
+                log_label=log_label,
+            )
+        except Exception:
+            self.logger.exception(
+                "LLM call failed label=%s prompt_len=%s", label, len(prompt)
+            )
+            raise
+        if output.startswith("Error in chat_"):
+            self.logger.error("LLM error output label=%s output=%s", label, output)
         self.logger.info("LLM_OUTPUT label=%s output=%s", label, output)
         return output
