@@ -161,6 +161,27 @@ class WorldEngine:
         node = self._require_node(identifier)
         node.value = value
 
+    def remove_node(self, identifier: str) -> List[str]:
+        node = self._require_node(identifier)
+        if identifier in {"world", "macro", "micro"}:
+            raise ValueError(f"Cannot remove root node: {identifier}")
+        removed: List[str] = []
+        parent = node.parent
+        if parent:
+            parent.children.pop(node.identifier, None)
+
+        def dfs(current: WorldNode) -> None:
+            for child in list(current.children.values()):
+                dfs(child)
+            removed.append(current.identifier)
+            current.children.clear()
+            current.parent = None
+            if current.identifier in self.nodes:
+                del self.nodes[current.identifier]
+
+        dfs(node)
+        return removed
+
     def generate_world(
         self,
         user_pitch: str,

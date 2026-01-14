@@ -9,6 +9,7 @@ from typing import Iterable, Optional
 
 from llm_api.llm_client import LLMClient
 from world.world_engine import WorldEngine, WorldNode
+from world.world_prompt import MICRO_POLITY_ASPECTS
 
 ADD_TAG = "<|ADD_NODE|>"
 UPDATE_TAG = "<|UPDATE_NODE|>"
@@ -126,6 +127,54 @@ class WorldAgent:
             )
             raise
 
+    def add_polity(self, region_identifier: str, polity_name: str) -> WorldNode:
+        try:
+            name = polity_name.strip()
+            if not name:
+                raise ValueError("polity_name is required")
+            region_id = self._resolve_region_id(region_identifier)
+            region = self.engine.view_node(region_id)
+            self._require_micro_region(region)
+            polity_key = self._choose_polity_key(region)
+            polity = self.engine.add_child(region.identifier, polity_key, name)
+            for aspect_id, aspect_key in MICRO_POLITY_ASPECTS:
+                self.engine.add_child(polity.identifier, aspect_id, aspect_key)
+            self.logger.info(
+                "add_polity region=%s polity=%s id=%s",
+                region.identifier,
+                polity.key,
+                polity.identifier,
+            )
+            return polity
+        except Exception:
+            self.logger.exception(
+                "add_polity failed region=%s polity=%s",
+                region_identifier,
+                polity_name,
+            )
+            raise
+
+    def remove_polity(
+        self, polity_identifier: str, region_identifier: Optional[str] = None
+    ) -> list[str]:
+        try:
+            polity_id = self._resolve_polity_id(polity_identifier, region_identifier)
+            polity = self.engine.view_node(polity_id)
+            if not self._is_micro_polity(polity):
+                raise ValueError(f"Node {polity_id} is not a micro polity")
+            removed = self.engine.remove_node(polity_id)
+            self.logger.info(
+                "remove_polity id=%s removed=%s", polity_id, len(removed)
+            )
+            return removed
+        except Exception:
+            self.logger.exception(
+                "remove_polity failed polity=%s region=%s",
+                polity_identifier,
+                region_identifier,
+            )
+            raise
+
     # Prompt builders -----------------------------------------------------
     def _build_extract_prompt(self, query: str) -> str:
         lines = [
@@ -222,6 +271,59 @@ class WorldAgent:
     # Helpers -------------------------------------------------------------
     def _iter_nodes(self) -> Iterable[WorldNode]:
         return sorted(self.engine.nodes.values(), key=lambda item: item.identifier)
+
+    def _resolve_region_id(self, region_identifier: str) -> str:
+        if region_identifier in self.engine.nodes:
+            return region_identifier
+        if "micro" not in self.engine.nodes:
+            raise KeyError("micro root not found")
+        for region in self.engine.view_children("micro"):
+            if region.key == region_identifier:
+                return region.identifier
+        raise KeyError(f"Region {region_identifier} not found")
+
+    def _resolve_polity_id(
+        self, polity_identifier: str, region_identifier: Optional[str]
+    ) -> str:
+        if polity_identifier in self.engine.nodes:
+            return polity_identifier
+        name = polity_identifier.strip()
+        if not name:
+            raise ValueError("polity_identifier is required")
+        if "micro" not in self.engine.nodes:
+            raise KeyError("micro root not found")
+        regions: list[WorldNode]
+        if region_identifier:
+            region_id = self._resolve_region_id(region_identifier)
+            region = self.engine.view_node(region_id)
+            self._require_micro_region(region)
+            regions = [region]
+        else:
+            regions = self.engine.view_children("micro")
+        matches = [
+            child.identifier
+            for region in regions
+            for child in region.children.values()
+            if child.key == name
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise KeyError(f"Polity {polity_identifier} not found")
+        raise ValueError(
+            f"Multiple polities named {polity_identifier}; specify region_identifier"
+        )
+
+    def _require_micro_region(self, region: WorldNode) -> None:
+        if region.identifier == "micro":
+            raise ValueError("Region identifier must not be micro root")
+        if not region.parent or region.parent.identifier != "micro":
+            raise ValueError(f"Node {region.identifier} is not a micro region")
+
+    def _is_micro_polity(self, polity: WorldNode) -> bool:
+        if not polity.parent:
+            return False
+        return bool(polity.parent.parent and polity.parent.parent.identifier == "micro")
 
     def _normalize_flag(self, flag: str) -> str:
         candidate = flag.strip()
@@ -322,6 +424,10 @@ class WorldAgent:
 
         base = "new1"
         return self._increment_key(base, existing)
+
+    def _choose_polity_key(self, region: WorldNode) -> str:
+        existing = {child.identifier.split(".")[-1] for child in region.children.values()}
+        return self._increment_key("p1", existing)
 
     def _increment_key(self, base: str, existing: set[str]) -> str:
         if base.isdigit():

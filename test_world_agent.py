@@ -8,6 +8,7 @@ from typing import List, Tuple
 from llm_api.llm_client import LLMClient
 from world.world_agent import ADD_TAG, WorldAgent
 from world.world_engine import WorldEngine
+from world.world_prompt import MICRO_POLITY_ASPECTS
 
 
 ORG_NAMES = [
@@ -266,6 +267,72 @@ def run_add_tests(
     return results
 
 
+def run_polity_tests(agent: WorldAgent, engine: WorldEngine) -> List[TestResult]:
+    results: List[TestResult] = []
+    if "micro" not in engine.nodes:
+        return [TestResult("polity", False, "missing_micro_root")]
+    regions = engine.view_children("micro")
+    if not regions:
+        return [TestResult("polity", False, "no_regions")]
+
+    region = random.choice(regions)
+    polity_name = f"新政权{random.randint(1000, 9999)}"
+    existing_ids = set(engine.nodes)
+    try:
+        polity = agent.add_polity(region.identifier, polity_name)
+    except Exception as exc:
+        results.append(TestResult("polity-add", False, f"exception: {exc}"))
+        results.append(TestResult("polity-remove", False, "skip_add_failed"))
+        return results
+
+    aspects = engine.view_children(polity.identifier)
+    aspect_ids = {child.identifier for child in aspects}
+    expected_ids = {
+        f"{polity.identifier}.{aspect_id}" for aspect_id, _ in MICRO_POLITY_ASPECTS
+    }
+    missing_ids = expected_ids - aspect_ids
+    extra_ids = aspect_ids - expected_ids
+    parent_ok = bool(polity.parent and polity.parent.identifier == region.identifier)
+    success = (
+        polity.identifier not in existing_ids
+        and polity.identifier in engine.nodes
+        and polity.key == polity_name
+        and parent_ok
+        and not missing_ids
+        and not extra_ids
+    )
+    if success:
+        detail = (
+            f"id={polity.identifier}; region={region.identifier}; "
+            f"aspects={len(aspects)}"
+        )
+    else:
+        detail = (
+            f"id={polity.identifier}; region={region.identifier}; "
+            f"missing={len(missing_ids)} extra={len(extra_ids)} parent_ok={parent_ok}"
+        )
+    results.append(TestResult("polity-add", success, detail))
+
+    try:
+        removed = agent.remove_polity(polity.identifier)
+    except Exception as exc:
+        results.append(TestResult("polity-remove", False, f"exception: {exc}"))
+        return results
+
+    removed_ids = set(removed)
+    expected_removed = expected_ids | {polity.identifier}
+    missing_removed = expected_removed - removed_ids
+    still_present = any(node_id in engine.nodes for node_id in expected_removed)
+    parent_has_child = polity.identifier in region.children
+    success = not missing_removed and not still_present and not parent_has_child
+    detail = (
+        f"removed={len(removed)} missing={len(missing_removed)} "
+        f"still_present={still_present}"
+    )
+    results.append(TestResult("polity-remove", success, detail))
+    return results
+
+
 def run_update_tests(
     agent: WorldAgent, engine: WorldEngine, recorder: RecordingLLMClient
 ) -> List[TestResult]:
@@ -351,13 +418,15 @@ def run_demo() -> None:
 
     query_results = run_query_tests(agent, engine, recorder)
     add_results = run_add_tests(agent, engine, recorder)
+    polity_results = run_polity_tests(agent, engine)
     update_results = run_update_tests(agent, engine, recorder)
 
     summarize_results("查询测试", query_results)
     summarize_results("新增测试", add_results)
+    summarize_results("政权增删测试", polity_results)
     summarize_results("更新测试", update_results)
 
-    overall = query_results + add_results + update_results
+    overall = query_results + add_results + polity_results + update_results
     summarize_results("总体成功率", overall)
 
 
