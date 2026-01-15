@@ -53,6 +53,9 @@ function showPage(name) {
   if (name === "character" && window.CharacterView) {
     window.CharacterView.load();
   }
+  if (name === "agent" && window.AgentTestView) {
+    window.AgentTestView.load();
+  }
 }
 
 function setProgress(completed, total) {
@@ -383,6 +386,10 @@ if (window.WorldView) {
 
 if (window.CharacterView) {
   window.CharacterView.init({ rootId: "character-root" });
+}
+
+if (window.AgentTestView) {
+  window.AgentTestView.init({ rootId: "agent-root" });
 }
 
 showScreen("landing");

@@ -7,6 +7,7 @@
     <link rel="stylesheet" href="app.css" />
     <link rel="stylesheet" href="world/world.css" />
     <link rel="stylesheet" href="character/character.css" />
+    <link rel="stylesheet" href="agent/agent.css" />
   </head>
   <body>
     <div class="backdrop"></div>
@@ -19,6 +20,7 @@
         <button class="nav-btn active" data-page="home">主界面</button>
         <button class="nav-btn" data-page="world">世界</button>
         <button class="nav-btn" data-page="character">角色</button>
+        <button class="nav-btn" data-page="agent">测试台</button>
         <button class="nav-btn" data-page="settings">设置</button>
       </nav>
     </header>
@@ -100,12 +102,15 @@
       <section id="screen-app" class="screen">
         <div class="card app-shell">
           <div class="app-page" data-page="home"></div>
-        <div class="app-page" data-page="world">
-          <div id="world-root" class="world-root"></div>
-        </div>
-        <div class="app-page" data-page="character">
+          <div class="app-page" data-page="world">
+            <div id="world-root" class="world-root"></div>
+          </div>
+          <div class="app-page" data-page="character">
             <div id="character-root" class="character-root"></div>
-        </div>
+          </div>
+          <div class="app-page" data-page="agent">
+            <div id="agent-root" class="agent-root"></div>
+          </div>
           <div class="app-page" data-page="settings">
             <div class="placeholder">设置功能预留。</div>
           </div>
@@ -115,6 +120,7 @@
 
     <script src="world/world.js"></script>
     <script src="character/character.js"></script>
+    <script src="agent/agent.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

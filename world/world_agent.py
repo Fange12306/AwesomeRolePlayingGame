@@ -221,7 +221,7 @@ class WorldAgent:
         return "\n".join(
             [
                 "【任务】更新节点内容",
-                "只输出更新后的节点内容，不要解释。",
+                "根据相关信息，重新编写节点内容，只输出更新后的节点内容，不要解释。",
                 f"节点：{node.identifier} {node.key}",
                 f"剧情信息：{update_info.strip()}",
                 f"原节点内容：{original}",

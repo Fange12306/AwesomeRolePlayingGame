@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
-from character.character_engine import CharacterEngine, CharacterRequest
+from character.character_agent import CharacterAgent
+from character.character_engine import CharacterEngine, CharacterRecord, CharacterRequest
+from game.game_agent import GameAgent
+from llm_api.llm_client import LLMClient
+from world.world_agent import WorldAgent
 from world.world_engine import WorldEngine
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -155,6 +159,100 @@ def _list_character_snapshots() -> list[Dict[str, Any]]:
             )
     snapshots.sort(key=lambda item: item.get("mtime", 0), reverse=True)
     return snapshots
+
+
+def _resolve_snapshot_item_path(item: Dict[str, Any]) -> Optional[Path]:
+    candidate = item.get("full_path") or item.get("path")
+    if not candidate:
+        return None
+    path = Path(candidate)
+    if not path.is_absolute():
+        path = SAVE_ROOT / path
+    return path if path.exists() else None
+
+
+def _format_save_path(path: Optional[Path]) -> str:
+    if not path:
+        return ""
+    try:
+        return str(path.relative_to(SAVE_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _load_world_snapshot() -> tuple[Optional[Dict[str, Dict[str, Any]]], Optional[Path]]:
+    with STATE.lock:
+        snapshot = STATE.snapshot
+        save_path = STATE.current_save
+    if snapshot:
+        return snapshot, save_path
+
+    latest = next(
+        (item for item in _list_world_snapshots() if _resolve_snapshot_item_path(item)),
+        None,
+    )
+    if not latest:
+        return None, None
+    path = _resolve_snapshot_item_path(latest)
+    if not path:
+        return None, None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        LOGGER.exception("load_world_snapshot failed path=%s", path)
+        return None, path
+    return payload, path
+
+
+def _load_character_snapshot(
+    snapshot_path: Optional[Path],
+) -> tuple[list[CharacterRecord], Dict[str, Any]]:
+    if not snapshot_path or not snapshot_path.exists():
+        return [], {}
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    records: list[CharacterRecord] = []
+    for item in payload.get("characters", []):
+        identifier = str(item.get("id", "")).strip()
+        if not identifier:
+            continue
+        records.append(
+            CharacterRecord(
+                identifier=identifier,
+                region_id=item.get("region_id"),
+                polity_id=item.get("polity_id"),
+                profile=item.get("profile", {}),
+            )
+        )
+    return records, payload
+
+
+def _normalize_action_name(flag: str) -> str:
+    cleaned = flag.strip()
+    if "ADD_NODE" in cleaned:
+        return "ADD_NODE"
+    if "UPDATE_NODE" in cleaned:
+        return "UPDATE_NODE"
+    if "ADD_CHARACTER" in cleaned:
+        return "ADD_CHARACTER"
+    if "UPDATE_CHARACTER" in cleaned:
+        return "UPDATE_CHARACTER"
+    return cleaned.strip("<|>").strip()
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in {"1", "true", "yes", "y"}:
+            return True
+        if cleaned in {"0", "false", "no", "n"}:
+            return False
+    return default
 
 
 def _resolve_snapshot_path(snapshot_path: str) -> Optional[Path]:
@@ -414,6 +512,9 @@ class RequestHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/characters/generate":
             self._handle_character_generate(payload)
             return
+        if parsed.path == "/api/game/plan":
+            self._handle_game_plan(payload)
+            return
 
         self.send_error(404, "Not found")
 
@@ -655,6 +756,166 @@ class RequestHandler(SimpleHTTPRequestHandler):
                 _write_snapshot(STATE.snapshot, STATE.current_save)
 
         self._send_json({"ok": True})
+
+    def _handle_game_plan(self, payload: Dict[str, Any]) -> None:
+        text = str(payload.get("text") or payload.get("input") or "").strip()
+        if not text:
+            self._send_json({"ok": False, "error": "missing_text"}, status=400)
+            return
+        apply_updates = _coerce_bool(payload.get("apply"), default=True)
+        snapshot, snapshot_path = _load_world_snapshot()
+        if not snapshot:
+            self._send_json({"ok": False, "error": "no_world_snapshot"}, status=404)
+            return
+
+        character_snapshot = next(
+            (
+                item
+                for item in _list_character_snapshots()
+                if _resolve_snapshot_item_path(item)
+            ),
+            None,
+        )
+        character_snapshot_path = (
+            _resolve_snapshot_item_path(character_snapshot) if character_snapshot else None
+        )
+
+        try:
+            llm_client = LLMClient()
+            if snapshot_path:
+                world_engine = WorldEngine.from_snapshot(
+                    snapshot_path, llm_client=llm_client
+                )
+            else:
+                world_engine = WorldEngine(
+                    world_spec_path=None, llm_client=llm_client, auto_generate=False
+                )
+                world_engine.apply_snapshot(snapshot)
+
+            records, character_payload = _load_character_snapshot(character_snapshot_path)
+            character_engine = CharacterEngine(
+                world_snapshot=snapshot,
+                world_snapshot_path=snapshot_path,
+                llm_client=llm_client,
+            )
+            character_engine.records = records
+            if character_payload:
+                relations = character_payload.get("relations") or []
+                location_edges = character_payload.get("character_location_edges") or []
+                if isinstance(relations, list):
+                    character_engine.relations = list(relations)
+                if isinstance(location_edges, list):
+                    character_engine.location_edges = list(location_edges)
+                payload_world_path = str(
+                    character_payload.get("world_snapshot_path", "")
+                ).strip()
+                if payload_world_path and not snapshot_path:
+                    candidate = Path(payload_world_path)
+                    if candidate.exists():
+                        character_engine.world_snapshot_path = candidate
+
+            world_agent = WorldAgent(world_engine, llm_client=llm_client)
+            character_agent = CharacterAgent(character_engine, llm_client=llm_client)
+            game_agent = GameAgent(
+                world_agent=world_agent,
+                character_agent=character_agent,
+                llm_client=llm_client,
+            )
+
+            decision = game_agent.decide_updates(text)
+            actions: list[Dict[str, str]] = []
+            applied = {"world": False, "character": False}
+            current_snapshot = snapshot
+            world_save_path = snapshot_path
+            character_save_path = character_snapshot_path
+            if decision.update_world:
+                world_decision = world_agent.decide_action(text)
+                node_label = ""
+                if apply_updates:
+                    world_node = world_agent.apply_update(
+                        world_decision.flag, world_decision.index, text
+                    )
+                    current_snapshot = world_engine.as_dict()
+                    if not world_save_path:
+                        world_save_path = SAVE_ROOT / f"world_{_timestamp()}.json"
+                    _write_snapshot(current_snapshot, world_save_path)
+                    with STATE.lock:
+                        STATE.snapshot = current_snapshot
+                        STATE.current_save = world_save_path
+                    applied["world"] = True
+                    node_label = world_node.key if world_node else ""
+                else:
+                    node = world_engine.view_node(world_decision.index)
+                    node_label = node.key
+                actions.append(
+                    {
+                        "agent": "world",
+                        "action": _normalize_action_name(world_decision.flag),
+                        "target": world_decision.index,
+                        "label": node_label,
+                    }
+                )
+                if apply_updates:
+                    character_engine.set_world_snapshot(current_snapshot)
+                    character_engine.world_snapshot_path = world_save_path
+            if decision.update_characters:
+                label = ""
+                character_decision = character_agent.decide_action(text)
+                if current_snapshot:
+                    character_engine.set_world_snapshot(current_snapshot)
+                if world_save_path:
+                    character_engine.world_snapshot_path = world_save_path
+                if apply_updates:
+                    character_record = character_agent.apply_update(
+                        character_decision.flag, character_decision.identifier, text
+                    )
+                    if isinstance(character_record.profile, dict):
+                        label = str(character_record.profile.get("name", "")).strip()
+                    character_save_path = character_save_path or (
+                        SAVE_ROOT / "characters" / f"characters_{_timestamp()}.json"
+                    )
+                    character_engine.save_snapshot(
+                        character_save_path, character_engine.records
+                    )
+                    applied["character"] = True
+                else:
+                    for record in character_engine.records:
+                        if record.identifier == character_decision.identifier:
+                            if isinstance(record.profile, dict):
+                                label = str(record.profile.get("name", "")).strip()
+                            break
+                actions.append(
+                    {
+                        "agent": "character",
+                        "action": _normalize_action_name(character_decision.flag),
+                        "target": character_decision.identifier,
+                        "label": label,
+                    }
+                )
+
+            response = {
+                "ok": True,
+                "decision": {
+                    "update_world": decision.update_world,
+                    "update_characters": decision.update_characters,
+                    "reason": decision.reason,
+                },
+                "actions": actions,
+                "applied": applied,
+                "context": {
+                    "world_snapshot": _format_save_path(world_save_path) or "当前内存快照",
+                    "character_snapshot": _format_save_path(character_save_path),
+                    "character_count": len(character_engine.records),
+                },
+            }
+            self._send_json(response)
+        except Exception as exc:
+            self.logger.exception(
+                "game_plan failed text_len=%s world_snapshot=%s",
+                len(text),
+                snapshot_path,
+            )
+            self._send_json({"ok": False, "error": str(exc)}, status=500)
 
     def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
         if status >= 400 or (isinstance(payload, dict) and payload.get("ok") is False):
