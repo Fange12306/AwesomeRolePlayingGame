@@ -318,7 +318,10 @@ class WorldAgent:
         return "\n".join(
             [
                 "【任务】更新节点内容",
-                "根据相关信息，重新编写节点内容，只输出更新后的节点内容，不要解释。",
+                "根据相关信息，必要时更新节点名称与内容。",
+                "只输出两行，格式如下：",
+                "<|KEY|>:节点名称(如不需要更新key则留空)",
+                "<|VALUE|>:更新后的节点内容",
                 f"节点：{node.identifier} {node.key}",
                 f"剧情信息：{update_info.strip()}",
                 f"原节点内容：{original}",
@@ -361,8 +364,11 @@ class WorldAgent:
         response = self._chat_once(
             prompt, system_prompt=self._system_prompt(), log_label="UPDATE_NODE"
         )
-        content = response.strip()
-        self.engine.update_node_content(index, content)
+        new_key, new_value = self._parse_update_response(response, node)
+        if new_key:
+            node.key = new_key
+        if new_value:
+            self.engine.update_node_content(index, new_value)
         return node
 
     def _apply_add(self, index: str, update_info: str) -> WorldNode:
@@ -847,6 +853,58 @@ class WorldAgent:
             normalized[-1] = (normalized[-1][0], fallback)
 
         return normalized
+
+    def _parse_update_response(
+        self, response: str, node: WorldNode
+    ) -> tuple[Optional[str], Optional[str]]:
+        key_value = self._parse_key_value_tags(response)
+        if key_value:
+            key, value = key_value
+            key = key.strip()
+            value = value.strip()
+            return (key or None, value or None)
+
+        data = self._parse_json_object(response)
+        if data:
+            key = str(data.get("key", "")).strip()
+            value = str(data.get("value", "")).strip()
+            return (key or None, value or None)
+
+        content = response.strip()
+        if not content:
+            return (None, None)
+        return (None, content)
+
+    def _parse_key_value_tags(self, response: str) -> Optional[tuple[str, str]]:
+        key = ""
+        value_lines: list[str] = []
+        capture_value = False
+        for line in response.splitlines():
+            key_match = re.match(r"<\|KEY\|>\s*[:：]?\s*(.*)", line)
+            if key_match:
+                key = key_match.group(1).strip()
+                capture_value = False
+                continue
+            value_match = re.match(r"<\|VALUE\|>\s*[:：]?\s*(.*)", line)
+            if value_match:
+                capture_value = True
+                value_lines.append(value_match.group(1).strip())
+                continue
+            if capture_value:
+                value_lines.append(line.strip())
+        if key or value_lines:
+            return key, "\n".join(value_lines).strip()
+        return None
+
+    def _parse_json_object(self, response: str) -> Optional[dict]:
+        for match in re.finditer(r"\{.*?\}", response, flags=re.DOTALL):
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                return data
+        return None
 
     def _infer_key(self, update_info: str) -> str:
         match = re.search(

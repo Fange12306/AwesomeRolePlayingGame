@@ -7,7 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
-from character.character_agent import CharacterActionDecision, CharacterAgent
+from character.character_agent import (
+    CharacterActionDecision,
+    CharacterAgent,
+    UPDATE_TAG as CHARACTER_UPDATE_TAG,
+)
 from character.character_engine import CharacterRecord
 from llm_api.llm_client import LLMClient
 from world.world_agent import ActionDecision, WorldAgent
@@ -18,6 +22,7 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(messa
 DEFAULT_SEARCH_ROUNDS = 2
 DEFAULT_SEARCH_LIMIT = 4
 DEFAULT_SEARCH_CONTEXT_LIMIT = 320
+DEFAULT_COMMAND_VALIDATE_ROUNDS = 2
 
 
 def _truncate_text(text: str, limit: int = 800) -> str:
@@ -61,6 +66,12 @@ class GameUpdateResult:
     character_record: Optional[CharacterRecord] = None
 
 
+@dataclass
+class SearchReadState:
+    world: dict[str, WorldNode] = field(default_factory=dict)
+    characters: dict[str, CharacterRecord] = field(default_factory=dict)
+
+
 class GameAgent:
     def __init__(
         self,
@@ -93,10 +104,13 @@ class GameAgent:
             bool(character_agent),
         )
 
-    def decide_updates(self, update_info: str) -> GameUpdateDecision:
+    def decide_updates(
+        self, update_info: str, read_context: Optional[list[str]] = None
+    ) -> GameUpdateDecision:
         response = ""
         try:
-            read_context = self._search_and_read(update_info)
+            if read_context is None:
+                read_context = self._search_and_read(update_info)
             prompt = self._build_decision_prompt(update_info, read_context)
             response = self._chat_once(
                 prompt, system_prompt=self._system_prompt(), log_label="GAME_DECIDE"
@@ -126,45 +140,138 @@ class GameAgent:
             raise
 
     def apply_update(self, update_info: str) -> GameUpdateResult:
-        decision = self.decide_updates(update_info)
+        search_state = self._run_search_and_read(update_info)
+        read_context = self._build_read_context_lines(
+            search_state.world, search_state.characters, DEFAULT_SEARCH_CONTEXT_LIMIT
+        )
+        decision = self.decide_updates(update_info, read_context=read_context)
         result = GameUpdateResult(decision=decision)
-        if decision.update_world:
-            if not self.world_agent:
-                raise ValueError("World agent is required for world updates")
-            if hasattr(self.world_agent, "collect_actions"):
-                world_decisions = self.world_agent.collect_actions(update_info)
-            else:
-                world_decisions = self.world_agent.decide_actions(update_info)
+        world_decisions: list[ActionDecision] = []
+        char_decisions: list[CharacterActionDecision] = []
+
+        for round_index in range(DEFAULT_COMMAND_VALIDATE_ROUNDS):
+            world_decisions = []
+            char_decisions = []
+            if decision.update_world:
+                if not self.world_agent:
+                    raise ValueError("World agent is required for world updates")
+                if hasattr(self.world_agent, "collect_actions"):
+                    world_decisions = self.world_agent.collect_actions(update_info)
+                else:
+                    world_decisions = self.world_agent.decide_actions(update_info)
+            if decision.update_characters:
+                if not self.character_agent:
+                    raise ValueError("Character agent is required for character updates")
+                if hasattr(self.character_agent, "collect_actions"):
+                    char_decisions = self.character_agent.collect_actions(update_info)
+                else:
+                    char_decisions = self.character_agent.decide_actions(update_info)
+
+            if not world_decisions and not char_decisions:
+                break
+
+            valid, reason = self._validate_commands(
+                update_info,
+                read_context,
+                decision,
+                world_decisions,
+                char_decisions,
+                round_index + 1,
+            )
+            if valid:
+                break
+            if round_index >= DEFAULT_COMMAND_VALIDATE_ROUNDS - 1:
+                self.logger.warning(
+                    "command_validation_failed rounds=%s reason=%s",
+                    DEFAULT_COMMAND_VALIDATE_ROUNDS,
+                    reason,
+                )
+                break
+            search_state = self._run_search_and_read(
+                update_info,
+                state=search_state,
+                max_rounds=DEFAULT_SEARCH_ROUNDS,
+                search_hint=reason,
+            )
+            read_context = self._build_read_context_lines(
+                search_state.world, search_state.characters, DEFAULT_SEARCH_CONTEXT_LIMIT
+            )
+            decision = self.decide_updates(update_info, read_context=read_context)
+            result.decision = decision
+
+        if decision.update_world and world_decisions:
+            world_nodes: list[WorldNode] = []
             world_nodes = self.world_agent.apply_updates(world_decisions, update_info)
             result.world_decisions = world_decisions
             result.world_nodes = world_nodes
             result.world_decision = world_decisions[0] if world_decisions else None
             result.world_node = world_nodes[0] if world_nodes else None
-        if decision.update_characters:
-            if not self.character_agent:
-                raise ValueError("Character agent is required for character updates")
-            if hasattr(self.character_agent, "collect_actions"):
-                char_decisions = self.character_agent.collect_actions(update_info)
-            else:
-                char_decisions = self.character_agent.decide_actions(update_info)
+        else:
+            world_nodes = []
+        if decision.update_characters and char_decisions:
             char_records = self.character_agent.apply_updates(char_decisions, update_info)
             result.character_decisions = char_decisions
             result.character_records = char_records
-            result.character_decision = char_decisions[0] if char_decisions else None
+            result.character_decision = (
+                char_decisions[0] if char_decisions else None
+            )
             result.character_record = char_records[0] if char_records else None
+
+        extra_decisions: list[CharacterActionDecision] = []
+        extra_records: list[CharacterRecord] = []
+        if world_decisions and world_nodes:
+            updated_ids = {item.identifier for item in char_decisions}
+            extra_decisions, extra_records = self._maybe_update_characters_for_polity_updates(
+                update_info,
+                world_decisions,
+                world_nodes,
+                updated_ids,
+            )
+        if extra_decisions:
+            result.character_decisions.extend(extra_decisions)
+            result.character_records.extend(extra_records)
+            if not result.character_decision:
+                result.character_decision = extra_decisions[0]
+            if not result.character_record and extra_records:
+                result.character_record = extra_records[0]
+            if not result.decision.update_characters:
+                result.decision = GameUpdateDecision(
+                    update_world=result.decision.update_world,
+                    update_characters=True,
+                    raw=result.decision.raw,
+                    reason=(result.decision.reason + ";polity_check").strip(";"),
+                )
         return result
 
     # Search & read ------------------------------------------------------
     def _search_and_read(self, update_info: str) -> list[str]:
+        state = self._run_search_and_read(update_info)
+        return self._build_read_context_lines(
+            state.world, state.characters, DEFAULT_SEARCH_CONTEXT_LIMIT
+        )
+
+    def _run_search_and_read(
+        self,
+        update_info: str,
+        state: Optional[SearchReadState] = None,
+        max_rounds: int = DEFAULT_SEARCH_ROUNDS,
+        search_hint: str = "",
+    ) -> SearchReadState:
         text = update_info.strip()
         if not text:
-            return []
+            return state or SearchReadState()
         if not self.world_agent and not self.character_agent:
-            return []
-        read_world: dict[str, WorldNode] = {}
-        read_characters: dict[str, CharacterRecord] = {}
-        for round_index in range(DEFAULT_SEARCH_ROUNDS):
-            prompt = self._build_search_prompt(update_info, read_world, read_characters)
+            return state or SearchReadState()
+        current = state or SearchReadState()
+        read_world = current.world
+        read_characters = current.characters
+        for round_index in range(max_rounds):
+            prompt = self._build_search_prompt(
+                update_info,
+                read_world,
+                read_characters,
+                search_hint=search_hint,
+            )
             response = self._chat_once(
                 prompt,
                 system_prompt=self._system_prompt(),
@@ -199,9 +306,7 @@ class GameAgent:
             if not new_world and not new_characters:
                 self.logger.info("search_round_no_new_items round=%s", round_index + 1)
                 break
-        return self._build_read_context_lines(
-            read_world, read_characters, DEFAULT_SEARCH_CONTEXT_LIMIT
-        )
+        return current
 
     # Prompt builders -----------------------------------------------------
     def _build_decision_prompt(
@@ -221,16 +326,37 @@ class GameAgent:
             lines.extend(read_context)
         if not read_context and self.character_agent and self.character_agent.engine.records:
             lines.append("现有角色：")
-            for record in self.character_agent.engine.records:
-                lines.append(self._summarize_character(record))
+            records = sorted(
+                self.character_agent.engine.records, key=lambda item: item.identifier
+            )
+            items = [
+                self._format_character_context_item(
+                    record, limit=DEFAULT_SEARCH_CONTEXT_LIMIT
+                )
+                for record in records
+            ]
+            lines.extend(
+                self._pack_items(
+                    f"C({len(items)})", items, DEFAULT_SEARCH_CONTEXT_LIMIT
+                )
+            )
         if not read_context and self.world_agent and self.world_agent.engine.nodes:
             lines.append("现有世界节点：")
             nodes = sorted(
                 self.world_agent.engine.nodes.values(),
                 key=lambda item: item.identifier,
             )
-            for node in nodes:
-                lines.append(self._summarize_world_node(node))
+            items = [
+                self._format_world_context_item(
+                    node, limit=DEFAULT_SEARCH_CONTEXT_LIMIT
+                )
+                for node in nodes
+            ]
+            lines.extend(
+                self._pack_items(
+                    f"W({len(items)})", items, DEFAULT_SEARCH_CONTEXT_LIMIT
+                )
+            )
         return "\n".join(lines)
 
     def _build_search_prompt(
@@ -238,6 +364,7 @@ class GameAgent:
         update_info: str,
         read_world: dict[str, WorldNode],
         read_characters: dict[str, CharacterRecord],
+        search_hint: str = "",
     ) -> str:
         max_items = DEFAULT_SEARCH_LIMIT
         read_world_ids = "、".join(read_world.keys()) if read_world else "无"
@@ -253,22 +380,35 @@ class GameAgent:
             f"已读取世界节点：{read_world_ids}",
             f"已读取角色：{read_character_ids}",
         ]
+        if search_hint:
+            lines.append(f"需要补充的上下文：{search_hint}")
         if self.world_agent and self.world_agent.engine.nodes:
             lines.append("可用世界节点：")
             nodes = sorted(
                 self.world_agent.engine.nodes.values(),
                 key=lambda item: item.identifier,
             )
-            for node in nodes:
-                lines.append(self._summarize_world_node_search(node))
+            items = [self._format_world_list_item(node) for node in nodes]
+            lines.extend(
+                self._pack_items(
+                    f"W({len(items)})", items, DEFAULT_SEARCH_CONTEXT_LIMIT
+                )
+            )
         else:
-            lines.append("可用世界节点：- 无")
+            lines.append("可用世界节点：无")
         if self.character_agent and self.character_agent.engine.records:
             lines.append("可用角色：")
-            for record in self.character_agent.engine.records:
-                lines.append(self._summarize_character(record))
+            records = sorted(
+                self.character_agent.engine.records, key=lambda item: item.identifier
+            )
+            items = [self._format_character_list_item(record) for record in records]
+            lines.extend(
+                self._pack_items(
+                    f"C({len(items)})", items, DEFAULT_SEARCH_CONTEXT_LIMIT
+                )
+            )
         else:
-            lines.append("可用角色：- 无")
+            lines.append("可用角色：无")
         return "\n".join(lines)
 
     def _build_search_decision_prompt(
@@ -295,6 +435,86 @@ class GameAgent:
             lines.append("已读取内容：无")
         return "\n".join(lines)
 
+    def _build_command_validation_prompt(
+        self,
+        update_info: str,
+        read_context: list[str],
+        decision: GameUpdateDecision,
+        world_decisions: list[ActionDecision],
+        character_decisions: list[CharacterActionDecision],
+    ) -> str:
+        lines = [
+            "【任务】判断调用命令是否合理",
+            "根据剧情信息与已读取内容判断即将调用的更新命令是否合理。",
+            "如果不合理，请回答 NO，并说明需要补充的上下文。",
+            "输出必须包含两处冗余，且只输出两行：",
+            "1) VALID=YES/NO",
+            '2) {"valid":true|false,"reason":"..."}',
+            f"剧情信息：{update_info.strip()}",
+            f"调用决策：world={decision.update_world}; characters={decision.update_characters}",
+        ]
+        if read_context:
+            lines.append("已读取内容：")
+            lines.extend(read_context)
+        else:
+            lines.append("已读取内容：无")
+
+        lines.append("调用命令：")
+        if world_decisions:
+            lines.append("世界：")
+            for item in world_decisions:
+                lines.append(self._summarize_world_command(item))
+        else:
+            lines.append("世界：- 无")
+        if character_decisions:
+            lines.append("角色：")
+            for item in character_decisions:
+                lines.append(self._summarize_character_command(item))
+        else:
+            lines.append("角色：- 无")
+        return "\n".join(lines)
+
+    def _build_polity_character_decision_prompt(
+        self,
+        update_info: str,
+        polities: list[WorldNode],
+        candidates: list[CharacterRecord],
+    ) -> str:
+        lines = [
+            "【任务】判断是否需要更新角色档案",
+            "根据剧情信息与政权更新，选择需要更新的角色ID。",
+            "仅在角色会受到该政权变化影响时选择。",
+            "输出必须包含两处冗余，且只输出两行：",
+            "1) UPDATE=ID1,ID2 或 NONE",
+            '2) {"update":["c1","c2"],"reason":"..."}',
+            f"剧情信息：{update_info.strip()}",
+            "已更新政权：",
+        ]
+        polity_items = [
+            self._format_polity_context_item(node, limit=DEFAULT_SEARCH_CONTEXT_LIMIT)
+            for node in polities
+        ]
+        lines.extend(
+            self._pack_items(
+                f"P({len(polity_items)})",
+                polity_items,
+                DEFAULT_SEARCH_CONTEXT_LIMIT,
+            )
+        )
+        lines.append("候选角色：")
+        character_items = [
+            self._format_character_context_item(record, limit=DEFAULT_SEARCH_CONTEXT_LIMIT)
+            for record in candidates
+        ]
+        lines.extend(
+            self._pack_items(
+                f"C({len(character_items)})",
+                character_items,
+                DEFAULT_SEARCH_CONTEXT_LIMIT,
+            )
+        )
+        return "\n".join(lines)
+
     # Helpers -------------------------------------------------------------
     def _summarize_character(self, record: CharacterRecord) -> str:
         name = ""
@@ -309,7 +529,7 @@ class GameAgent:
         return f"- {' '.join(parts)} {label}".strip()
 
     def _summarize_world_node(self, node: WorldNode, limit: int = 240) -> str:
-        value = (node.value or "").strip()
+        value = self._compact_text((node.value or "").strip())
         summary = _truncate_text(value, limit=limit) if value else ""
         label = f": {summary}" if summary else ""
         return f"- {node.identifier} {node.key}{label}".strip()
@@ -317,19 +537,175 @@ class GameAgent:
     def _summarize_world_node_search(self, node: WorldNode) -> str:
         return f"- {node.identifier} {node.key}".strip()
 
-    def _summarize_character_profile(
-        self, record: CharacterRecord, limit: int = DEFAULT_SEARCH_CONTEXT_LIMIT
-    ) -> str:
+    def _compact_text(self, text: str) -> str:
+        return " ".join(text.split())
+
+    def _pack_items(self, label: str, items: list[str], max_line_len: int) -> list[str]:
+        lines: list[str] = []
+        prefix = f"{label}: "
+        current = prefix
+        for item in items:
+            cleaned = item.strip()
+            if not cleaned:
+                continue
+            if current == prefix:
+                candidate = f"{prefix}{cleaned}"
+            else:
+                candidate = f"{current} | {cleaned}"
+            if len(candidate) > max_line_len and current != prefix:
+                lines.append(current)
+                current = f"{prefix}{cleaned}"
+            else:
+                current = candidate
+        if current != prefix:
+            lines.append(current)
+        return lines
+
+    def _format_world_context_item(self, node: WorldNode, limit: int) -> str:
+        value = self._compact_text((node.value or "").strip())
+        summary = _truncate_text(value, limit=limit) if value else ""
+        if summary:
+            return f"{node.identifier}/{node.key}={summary}"
+        return f"{node.identifier}/{node.key}"
+
+    def _format_world_list_item(self, node: WorldNode) -> str:
+        return f"{node.identifier}/{node.key}".strip()
+
+    def _format_character_list_item(self, record: CharacterRecord) -> str:
         name = ""
         if isinstance(record.profile, dict):
             name = str(record.profile.get("name", "")).strip()
-        profile = self._format_character_profile(record.profile)
-        summary = _truncate_text(profile, limit=limit) if profile else ""
-        label = f": {summary}" if summary else ""
-        parts = [record.identifier]
-        if name:
-            parts.append(name)
-        return f"- {' '.join(parts)}{label}".strip()
+        label = f"/{name}" if name else ""
+        return f"{record.identifier}{label}".strip()
+
+    def _format_character_context_item(
+        self, record: CharacterRecord, limit: int
+    ) -> str:
+        name = ""
+        summary = ""
+        extras: list[str] = []
+        if isinstance(record.profile, dict):
+            name = str(record.profile.get("name", "")).strip()
+            summary = self._compact_text(str(record.profile.get("summary", "")).strip())
+            for key in ("profession", "faction", "species", "tier"):
+                value = str(record.profile.get(key, "")).strip()
+                if value:
+                    extras.append(f"{key}={self._compact_text(value)}")
+        base = f"{record.identifier}/{name}" if name else record.identifier
+        detail_parts: list[str] = []
+        if summary:
+            detail_parts.append(summary)
+        if extras:
+            detail_parts.append(",".join(extras))
+        detail = " | ".join(detail_parts).strip()
+        if detail:
+            detail = _truncate_text(detail, limit=limit)
+            return f"{base}={detail}"
+        return base
+
+    def _format_polity_context_item(self, node: WorldNode, limit: int) -> str:
+        value = self._compact_text((node.value or "").strip())
+        summary = _truncate_text(value, limit=limit) if value else ""
+        if summary:
+            return f"{node.identifier}/{node.key}={summary}"
+        return f"{node.identifier}/{node.key}"
+
+    def _build_polity_update_context(
+        self, polities: list[WorldNode], limit: int
+    ) -> str:
+        if not polities:
+            return ""
+        items = [
+            self._format_polity_context_item(node, limit=limit)
+            for node in polities
+        ]
+        joined = "；".join(item for item in items if item)
+        if not joined:
+            return ""
+        return f"关联政权更新：{joined}"
+
+    def _is_micro_polity(self, node: WorldNode) -> bool:
+        return bool(node.parent and node.parent.parent and node.parent.parent.identifier == "micro")
+
+    def _resolve_polity_from_node(self, node: WorldNode) -> Optional[WorldNode]:
+        if self._is_micro_polity(node):
+            return node
+        if node.parent and self._is_micro_polity(node.parent):
+            return node.parent
+        return None
+
+    def _collect_polity_nodes_from_updates(
+        self,
+        world_decisions: list[ActionDecision],
+        world_nodes: list[WorldNode],
+    ) -> list[WorldNode]:
+        polities: dict[str, WorldNode] = {}
+        for idx, decision in enumerate(world_decisions):
+            if self._normalize_action_name(decision.flag) != "UPDATE_NODE":
+                continue
+            node = world_nodes[idx] if idx < len(world_nodes) else None
+            if not node:
+                continue
+            polity = self._resolve_polity_from_node(node)
+            if polity:
+                polities[polity.identifier] = polity
+        return list(polities.values())
+
+    def _find_characters_for_polities(
+        self, polities: list[WorldNode]
+    ) -> list[CharacterRecord]:
+        if not self.character_agent or not polities:
+            return []
+        polity_ids = {node.identifier for node in polities}
+        candidates: list[CharacterRecord] = []
+        for record in self.character_agent.engine.records:
+            if record.polity_id and record.polity_id in polity_ids:
+                candidates.append(record)
+        return candidates
+
+    def _summarize_world_command(self, decision: ActionDecision) -> str:
+        action = self._normalize_action_name(decision.flag)
+        label = ""
+        if self.world_agent:
+            node = self.world_agent.engine.nodes.get(decision.index)
+            if node:
+                label = node.key.strip()
+        suffix = f" {label}" if label else ""
+        return f"- {action} {decision.index}{suffix}".strip()
+
+    def _summarize_character_command(
+        self, decision: CharacterActionDecision
+    ) -> str:
+        action = self._normalize_action_name(decision.flag)
+        name = ""
+        if self.character_agent:
+            for record in self.character_agent.engine.records:
+                if record.identifier == decision.identifier:
+                    if isinstance(record.profile, dict):
+                        name = str(record.profile.get("name", "")).strip()
+                    break
+        suffix = f" {name}" if name else ""
+        return f"- {action} {decision.identifier}{suffix}".strip()
+
+    def _summarize_character_profile(
+        self, record: CharacterRecord, limit: int = DEFAULT_SEARCH_CONTEXT_LIMIT
+    ) -> str:
+        item = self._format_character_context_item(record, limit=limit)
+        if not item:
+            return f"- {record.identifier}".strip()
+        return f"- {item}".strip()
+
+    def _normalize_action_name(self, flag: str) -> str:
+        cleaned = flag.strip()
+        if "ADD_NODE" in cleaned:
+            return "ADD_NODE"
+        if "UPDATE_NODE" in cleaned:
+            return "UPDATE_NODE"
+        if "ADD_CHARACTER" in cleaned:
+            return "ADD_CHARACTER"
+        if "UPDATE_CHARACTER" in cleaned:
+            return "UPDATE_CHARACTER"
+        return cleaned.strip("<|>").strip()
 
     def _format_character_profile(self, profile: Dict[str, object] | str) -> str:
         if isinstance(profile, dict):
@@ -344,13 +720,19 @@ class GameAgent:
     ) -> list[str]:
         lines: list[str] = []
         if read_world:
-            lines.append("世界节点：")
-            for node in sorted(read_world.values(), key=lambda item: item.identifier):
-                lines.append(self._summarize_world_node(node, limit=limit))
+            items = [
+                self._format_world_context_item(node, limit=limit)
+                for node in sorted(read_world.values(), key=lambda item: item.identifier)
+            ]
+            lines.extend(self._pack_items(f"W({len(items)})", items, limit))
         if read_characters:
-            lines.append("角色档案：")
-            for record in sorted(read_characters.values(), key=lambda item: item.identifier):
-                lines.append(self._summarize_character_profile(record, limit=limit))
+            items = [
+                self._format_character_context_item(record, limit=limit)
+                for record in sorted(
+                    read_characters.values(), key=lambda item: item.identifier
+                )
+            ]
+            lines.extend(self._pack_items(f"C({len(items)})", items, limit))
         return lines
 
     def _parse_search_response(self, response: str) -> tuple[list[str], list[str]]:
@@ -403,6 +785,140 @@ class GameAgent:
             if decision is not None:
                 return decision
         return False
+
+    def _parse_character_update_ids(
+        self, response: str, candidate_ids: set[str]
+    ) -> list[str]:
+        updates: list[str] = []
+        for match in re.finditer(r"\{.*?\}", response, flags=re.DOTALL):
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            updates.extend(self._coerce_id_list(data.get("update")))
+
+        if not updates:
+            update_match = re.search(
+                r"UPDATE\s*[:=]\s*([^\n]+)", response, re.IGNORECASE
+            )
+            if update_match:
+                raw = update_match.group(1).strip()
+                if raw.upper() not in {"NONE", "NO", "无"}:
+                    updates.extend(self._split_identifiers(raw))
+
+        seen: set[str] = set()
+        filtered: list[str] = []
+        for identifier in updates:
+            if identifier in candidate_ids and identifier not in seen:
+                filtered.append(identifier)
+                seen.add(identifier)
+        return filtered
+
+    def _parse_command_validation(self, response: str) -> tuple[bool, str]:
+        for match in re.finditer(r"\{.*?\}", response, flags=re.DOTALL):
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                continue
+            if "valid" in data:
+                decision = self._coerce_bool(data.get("valid"))
+                if decision is not None:
+                    reason = str(data.get("reason", "")).strip()
+                    return decision, reason
+        valid_match = re.search(r"VALID\s*[:=]\s*([A-Za-z0-9]+)", response, re.IGNORECASE)
+        if valid_match:
+            decision = self._coerce_bool(valid_match.group(1))
+            if decision is not None:
+                return decision, ""
+        return False, ""
+
+    def _validate_commands(
+        self,
+        update_info: str,
+        read_context: list[str],
+        decision: GameUpdateDecision,
+        world_decisions: list[ActionDecision],
+        character_decisions: list[CharacterActionDecision],
+        round_index: int,
+    ) -> tuple[bool, str]:
+        prompt = self._build_command_validation_prompt(
+            update_info,
+            read_context,
+            decision,
+            world_decisions,
+            character_decisions,
+        )
+        response = self._chat_once(
+            prompt,
+            system_prompt=self._system_prompt(),
+            log_label=f"GAME_COMMAND_VALIDATE_{round_index}",
+        )
+        valid, reason = self._parse_command_validation(response)
+        self.logger.info(
+            "command_validation round=%s valid=%s reason=%s",
+            round_index,
+            valid,
+            reason,
+        )
+        return valid, reason
+
+    def _maybe_update_characters_for_polity_updates(
+        self,
+        update_info: str,
+        world_decisions: list[ActionDecision],
+        world_nodes: list[WorldNode],
+        skip_ids: set[str],
+    ) -> tuple[list[CharacterActionDecision], list[CharacterRecord]]:
+        if not self.character_agent:
+            return [], []
+        polities = self._collect_polity_nodes_from_updates(world_decisions, world_nodes)
+        if not polities:
+            return [], []
+        candidates = self._find_characters_for_polities(polities)
+        if not candidates:
+            return [], []
+        candidate_ids = {record.identifier for record in candidates}
+        prompt = self._build_polity_character_decision_prompt(
+            update_info, polities, candidates
+        )
+        response = self._chat_once(
+            prompt,
+            system_prompt=self._system_prompt(),
+            log_label="GAME_POLITY_CHARACTER_DECIDE",
+        )
+        update_ids = self._parse_character_update_ids(response, candidate_ids)
+        update_ids = [item for item in update_ids if item not in skip_ids]
+        if not update_ids:
+            return [], []
+        context = self._build_polity_update_context(
+            polities, limit=DEFAULT_SEARCH_CONTEXT_LIMIT
+        )
+        if context:
+            update_payload = f"{update_info.strip()}\n{context}"
+        else:
+            update_payload = update_info
+        decisions: list[CharacterActionDecision] = []
+        records: list[CharacterRecord] = []
+        for identifier in update_ids:
+            decision = CharacterActionDecision(
+                flag=CHARACTER_UPDATE_TAG,
+                identifier=identifier,
+                raw="polity_check",
+            )
+            record = self.character_agent.apply_update(
+                decision.flag, decision.identifier, update_payload
+            )
+            decisions.append(decision)
+            records.append(record)
+        self.logger.info(
+            "polity_character_updates polities=%s candidates=%s updated=%s",
+            len(polities),
+            len(candidates),
+            len(decisions),
+        )
+        return decisions, records
 
     def _read_world_nodes(
         self,

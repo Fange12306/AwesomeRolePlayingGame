@@ -17,7 +17,7 @@ from character.character_engine import CharacterEngine, CharacterRecord, Charact
 from game.game_agent import GameAgent
 from llm_api.llm_client import LLMClient
 from world.world_agent import WorldAgent
-from world.world_engine import WorldEngine
+from world.world_engine import WorldEngine, WorldNode
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_ROOT = BASE_DIR / "web"
