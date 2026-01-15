@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +48,10 @@ class GameUpdateDecision:
 @dataclass
 class GameUpdateResult:
     decision: GameUpdateDecision
+    world_decisions: list[ActionDecision] = field(default_factory=list)
+    world_nodes: list[WorldNode] = field(default_factory=list)
+    character_decisions: list[CharacterActionDecision] = field(default_factory=list)
+    character_records: list[CharacterRecord] = field(default_factory=list)
     world_decision: Optional[ActionDecision] = None
     world_node: Optional[WorldNode] = None
     character_decision: Optional[CharacterActionDecision] = None
@@ -123,21 +127,27 @@ class GameAgent:
         if decision.update_world:
             if not self.world_agent:
                 raise ValueError("World agent is required for world updates")
-            world_decision = self.world_agent.decide_action(update_info)
-            world_node = self.world_agent.apply_update(
-                world_decision.flag, world_decision.index, update_info
-            )
-            result.world_decision = world_decision
-            result.world_node = world_node
+            if hasattr(self.world_agent, "collect_actions"):
+                world_decisions = self.world_agent.collect_actions(update_info)
+            else:
+                world_decisions = self.world_agent.decide_actions(update_info)
+            world_nodes = self.world_agent.apply_updates(world_decisions, update_info)
+            result.world_decisions = world_decisions
+            result.world_nodes = world_nodes
+            result.world_decision = world_decisions[0] if world_decisions else None
+            result.world_node = world_nodes[0] if world_nodes else None
         if decision.update_characters:
             if not self.character_agent:
                 raise ValueError("Character agent is required for character updates")
-            char_decision = self.character_agent.decide_action(update_info)
-            char_record = self.character_agent.apply_update(
-                char_decision.flag, char_decision.identifier, update_info
-            )
-            result.character_decision = char_decision
-            result.character_record = char_record
+            if hasattr(self.character_agent, "collect_actions"):
+                char_decisions = self.character_agent.collect_actions(update_info)
+            else:
+                char_decisions = self.character_agent.decide_actions(update_info)
+            char_records = self.character_agent.apply_updates(char_decisions, update_info)
+            result.character_decisions = char_decisions
+            result.character_records = char_records
+            result.character_decision = char_decisions[0] if char_decisions else None
+            result.character_record = char_records[0] if char_records else None
         return result
 
     # Prompt builders -----------------------------------------------------

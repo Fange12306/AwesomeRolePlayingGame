@@ -78,6 +78,13 @@ const CharacterView = (() => {
     await loadSnapshots();
   }
 
+  async function loadLatest(path) {
+    if (path) {
+      currentPath = path;
+    }
+    await loadSnapshots();
+  }
+
   async function loadSnapshots() {
     if (!elements.select || !elements.refreshBtn) {
       return;
@@ -513,6 +520,7 @@ const CharacterView = (() => {
   return {
     init,
     load,
+    loadLatest,
   };
 })();
 

@@ -20,6 +20,7 @@ ADD_TAG = "<|ADD_CHARACTER|>"
 UPDATE_TAG = "<|UPDATE_CHARACTER|>"
 DEFAULT_LOG_PATH = Path("log") / "character_agent.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(message)s"
+DEFAULT_MAX_ACTIONS = 3
 
 
 def _truncate_text(text: str, limit: int = 800) -> str:
@@ -96,33 +97,55 @@ class CharacterAgent:
             raise
 
     def decide_action(self, update_info: str) -> CharacterActionDecision:
+        decisions = self.decide_actions(update_info)
+        if len(decisions) > 1:
+            self.logger.info("decide_action picked first action total=%s", len(decisions))
+        return decisions[0]
+
+    def decide_actions(
+        self, update_info: str, max_actions: int = DEFAULT_MAX_ACTIONS
+    ) -> list[CharacterActionDecision]:
         response = ""
         try:
-            prompt = self._build_decision_prompt(update_info)
+            prompt = self._build_decision_prompt(update_info, max_actions=max_actions)
             response = self._chat_once(
                 prompt, system_prompt=self._system_prompt(), log_label="CHARACTER_DECIDE"
             )
-            flag, identifier = self._parse_decision(response)
-            normalized = self._normalize_flag(flag)
-            if normalized == UPDATE_TAG:
-                if not self._find_record(identifier):
-                    raise ValueError(f"Character {identifier} not found for decision")
-            elif normalized == ADD_TAG:
-                identifier = self._ensure_new_identifier(identifier)
-            else:
-                raise ValueError(f"Unknown action flag: {flag}")
+            parsed = self._parse_decisions(response)
+            decisions: list[CharacterActionDecision] = []
+            seen: set[tuple[str, str]] = set()
+            reserved_ids: set[str] = set()
+            for flag, identifier in parsed:
+                normalized = self._normalize_flag(flag)
+                if normalized == UPDATE_TAG:
+                    if not identifier or not self._find_record(identifier):
+                        continue
+                    decision_id = identifier
+                elif normalized == ADD_TAG:
+                    decision_id = self._ensure_new_identifier(identifier, reserved_ids)
+                    reserved_ids.add(decision_id)
+                else:
+                    continue
+                key = (normalized, decision_id)
+                if key in seen:
+                    continue
+                decisions.append(
+                    CharacterActionDecision(
+                        flag=normalized, identifier=decision_id, raw=response
+                    )
+                )
+                seen.add(key)
+                if len(decisions) >= max_actions:
+                    break
+            if not decisions:
+                raise ValueError("No valid character decisions parsed from response")
             self.logger.info(
-                "decide_action flag=%s id=%s info_len=%s",
-                normalized,
-                identifier,
-                len(update_info),
+                "decide_actions count=%s info_len=%s", len(decisions), len(update_info)
             )
-            return CharacterActionDecision(
-                flag=normalized, identifier=identifier, raw=response
-            )
+            return decisions
         except Exception:
             self.logger.exception(
-                "decide_action failed info_len=%s response=%s",
+                "decide_actions failed info_len=%s response=%s",
                 len(update_info),
                 _truncate_text(response),
             )
@@ -151,6 +174,47 @@ class CharacterAgent:
             )
             raise
 
+    def collect_actions(
+        self, update_info: str, max_actions: Optional[int] = None
+    ) -> list[CharacterActionDecision]:
+        inferred = self._infer_actions_from_text(update_info)
+        candidate_count = len({action.identifier for action in inferred})
+        llm_limit = max_actions
+        if llm_limit is None:
+            llm_limit = max(DEFAULT_MAX_ACTIONS, min(8, candidate_count)) or DEFAULT_MAX_ACTIONS
+        decisions: list[CharacterActionDecision] = []
+        try:
+            decisions = self.decide_actions(
+                update_info, max_actions=llm_limit
+            )
+        except Exception:
+            self.logger.warning(
+                "collect_actions fallback to heuristics info_len=%s",
+                len(update_info),
+            )
+        combined: list[CharacterActionDecision] = []
+        seen: set[tuple[str, str]] = set()
+        for action in decisions + inferred:
+            key = (action.flag, action.identifier)
+            if key in seen:
+                continue
+            combined.append(action)
+            seen.add(key)
+            if max_actions is not None and len(combined) >= max_actions:
+                break
+        if not combined:
+            raise ValueError("No valid character actions collected from response or heuristics")
+        return combined
+
+    def apply_updates(
+        self, actions: Iterable[CharacterActionDecision], update_info: str
+    ) -> list[CharacterRecord]:
+        records: list[CharacterRecord] = []
+        for action in actions:
+            record = self.apply_update(action.flag, action.identifier, update_info)
+            records.append(record)
+        return records
+
     def create_character(
         self, update_info: str, identifier: str = ""
     ) -> CharacterRecord:
@@ -170,13 +234,16 @@ class CharacterAgent:
             lines.append(self._summarize_character(record))
         return "\n".join(lines)
 
-    def _build_decision_prompt(self, update_info: str) -> str:
+    def _build_decision_prompt(
+        self, update_info: str, max_actions: int = DEFAULT_MAX_ACTIONS
+    ) -> str:
         lines = [
             "【任务】判断更新操作",
             "你需要决定是新增角色还是修改角色。",
+            f"如果涉及多个角色，最多输出 {max_actions} 条操作。",
             "输出必须包含两处冗余，且只输出两行：",
-            f"1) {ADD_TAG}:ID 或 {UPDATE_TAG}:ID",
-            '2) {"action":"ADD_CHARACTER"|"UPDATE_CHARACTER","id":"ID"}',
+            f"1) {ADD_TAG}:ID 或 {UPDATE_TAG}:ID (多条用逗号分隔)",
+            '2) [{"action":"ADD_CHARACTER"|"UPDATE_CHARACTER","id":"ID"}, ...]',
             "UPDATE 时 ID 必须是已有角色ID；ADD 时请给出新角色ID或留空。",
             f"剧情信息：{update_info.strip()}",
             "可用角色：",
@@ -264,13 +331,37 @@ class CharacterAgent:
         return candidate
 
     def _parse_decision(self, response: str) -> tuple[str, str]:
-        tag_match = re.search(
-            r"<\|(ADD_CHARACTER|UPDATE_CHARACTER)\|>\s*[:：]\s*([^\s]+)",
+        decisions = self._parse_decisions(response)
+        if not decisions:
+            raise ValueError(f"Unable to parse decision from response: {response}")
+        return decisions[0]
+
+    def _parse_decisions(self, response: str) -> list[tuple[str, str]]:
+        actions: list[tuple[str, str]] = []
+        for match in re.finditer(
+            r"<\|(ADD_CHARACTER|UPDATE_CHARACTER)\|>\s*[:：]\s*([^\s,;]*)",
             response,
-        )
-        if tag_match:
-            flag = f"<|{tag_match.group(1)}|>"
-            return flag, tag_match.group(2).strip()
+        ):
+            flag = f"<|{match.group(1)}|>"
+            identifier = match.group(2).strip()
+            actions.append((flag, identifier))
+
+        bracket_start = response.find("[")
+        bracket_end = response.rfind("]")
+        if bracket_start >= 0 and bracket_end > bracket_start:
+            fragment = response[bracket_start : bracket_end + 1]
+            try:
+                data = json.loads(fragment)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    action = str(item.get("action", "")).strip().upper()
+                    identifier = str(item.get("id", "")).strip()
+                    if action in {"ADD_CHARACTER", "UPDATE_CHARACTER"}:
+                        actions.append((f"<|{action}|>", identifier))
 
         for match in re.finditer(r"\{.*?\}", response, flags=re.DOTALL):
             try:
@@ -280,9 +371,9 @@ class CharacterAgent:
             action = str(data.get("action", "")).strip().upper()
             identifier = str(data.get("id", "")).strip()
             if action in {"ADD_CHARACTER", "UPDATE_CHARACTER"}:
-                return f"<|{action}|>", identifier
+                actions.append((f"<|{action}|>", identifier))
 
-        raise ValueError(f"Unable to parse decision from response: {response}")
+        return actions
 
     def _parse_query_identifier(self, response: str) -> Optional[str]:
         cleaned = response.strip().strip("\"'")
@@ -316,14 +407,19 @@ class CharacterAgent:
                     return output.strip()
         return output.strip()
 
-    def _ensure_new_identifier(self, identifier: str) -> str:
+    def _ensure_new_identifier(
+        self, identifier: str, reserved: Optional[set[str]] = None
+    ) -> str:
         candidate = identifier.strip() if identifier else ""
-        if not candidate or self._find_record(candidate):
-            candidate = self._next_identifier()
+        reserved_set = reserved or set()
+        if not candidate or self._find_record(candidate) or candidate in reserved_set:
+            candidate = self._next_identifier(reserved_set)
         return candidate
 
-    def _next_identifier(self) -> str:
+    def _next_identifier(self, reserved: Optional[set[str]] = None) -> str:
         existing = {record.identifier for record in self.engine.records}
+        if reserved:
+            existing |= reserved
         numbers = []
         for item in existing:
             match = re.match(r"c(\d+)$", item)
@@ -402,6 +498,44 @@ class CharacterAgent:
             labels.append(f"简述:{summary}")
         label_text = " | ".join(labels)
         return f"- {' '.join(parts)} | {label_text}" if label_text else f"- {' '.join(parts)}"
+
+    def _infer_actions_from_text(self, update_info: str) -> list[CharacterActionDecision]:
+        text = update_info.strip()
+        if not text:
+            return []
+        candidates: list[str] = []
+        candidates.extend(re.findall(r"\bc\d+\b", text, re.IGNORECASE))
+        for record in self.engine.records:
+            if record.identifier and record.identifier in text:
+                candidates.append(record.identifier)
+        name_map: dict[str, list[str]] = {}
+        for record in self.engine.records:
+            if not isinstance(record.profile, dict):
+                continue
+            name = str(record.profile.get("name", "")).strip()
+            if not name:
+                continue
+            name_map.setdefault(name, []).append(record.identifier)
+        for name, ids in name_map.items():
+            if len(ids) != 1:
+                continue
+            if name in text:
+                candidates.append(ids[0])
+
+        actions: list[CharacterActionDecision] = []
+        seen: set[str] = set()
+        for identifier in candidates:
+            resolved = identifier.strip()
+            record = self._find_record(resolved)
+            if not record:
+                continue
+            if resolved in seen:
+                continue
+            actions.append(
+                CharacterActionDecision(flag=UPDATE_TAG, identifier=resolved, raw="heuristic")
+            )
+            seen.add(resolved)
+        return actions
 
     def _system_prompt(self) -> str:
         return (

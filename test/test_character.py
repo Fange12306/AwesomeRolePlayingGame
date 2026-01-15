@@ -71,7 +71,7 @@ def _prompt_int(prompt: str, default: int, minimum: int = 0) -> int:
 def _choose_world_snapshot() -> Path | None:
     snapshots = _list_snapshots()
     if not snapshots:
-        print("No world snapshots found. Run `python test_world.py` first.")
+        print("No world snapshots found. Run `python test/test_world.py` first.")
         return None
 
     print("\nAvailable world snapshots:")

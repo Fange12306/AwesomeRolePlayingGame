@@ -190,6 +190,19 @@ def format_character_label(record: CharacterRecord) -> str:
     return name or record.identifier
 
 
+def _has_world_updates(result: GameUpdateResult) -> bool:
+    nodes = result.world_nodes or ([result.world_node] if result.world_node else [])
+    return any(node and node.value.strip() for node in nodes)
+
+
+def _has_character_updates(result: GameUpdateResult) -> bool:
+    records = (
+        result.character_records
+        or ([result.character_record] if result.character_record else [])
+    )
+    return any(record and str(record.profile).strip() for record in records)
+
+
 def run_both_tests(
     world_snapshot: Path,
     world_data: dict[str, dict[str, object]],
@@ -230,10 +243,10 @@ def run_both_tests(
             f"world={decision.update_world} characters={decision.update_characters}"
         )
         if success:
-            if not result.world_node or not result.world_node.value.strip():
+            if not _has_world_updates(result):
                 success = False
                 detail = f"world_empty; {detail}"
-            if not result.character_record or not str(result.character_record.profile).strip():
+            if not _has_character_updates(result):
                 success = False
                 detail = f"character_empty; {detail}"
         results.append(
@@ -284,7 +297,7 @@ def run_world_only_tests(
         detail = (
             f"world={decision.update_world} characters={decision.update_characters}"
         )
-        if success and (not result.world_node or not result.world_node.value.strip()):
+        if success and not _has_world_updates(result):
             success = False
             detail = f"world_empty; {detail}"
         results.append(
@@ -335,9 +348,7 @@ def run_character_only_tests(
         detail = (
             f"world={decision.update_world} characters={decision.update_characters}"
         )
-        if success and (
-            not result.character_record or not str(result.character_record.profile).strip()
-        ):
+        if success and not _has_character_updates(result):
             success = False
             detail = f"character_empty; {detail}"
         results.append(

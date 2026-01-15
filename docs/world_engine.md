@@ -15,12 +15,13 @@ World graph utilities backed by `world/world_engine.py` and `world/world_prompt.
 - `update_node_content(identifier, value)`：更新节点内容。
 - `generate_world(user_pitch, regenerate=False)`：先生成 macro 节点内容，再生成 micro 结构与缺失内容。
 - `as_dict()`：将整棵树序列化为字典，便于调试或存档。
+- `micro_scale`：初始化参数，控制 micro 树规模（small/medium/large）。
 
 ## LLM 生成流程
 1) 解析 `world/world_spec.md`，生成 macro 节点（key 取模板标题）。
 2) 逐个 macro 节点调用 LLM 填充 value。
-3) 单次对话生成 micro 地区名称列表（2-7 个）。
-4) 对每个地区单次对话生成政权名称列表（2-7 个），并为政权挂载 7 个固定子节点：文化/经济/政治/人口/地理/技术/资源。
+3) 单次对话生成 micro 地区名称列表（small 2-3，medium 3-5，large 5-7 个）。
+4) 对每个地区单次对话生成政权名称列表（范围同上），并为政权挂载 7 个固定子节点：文化/经济/政治/人口/地理/技术/资源。
 5) 遍历 micro 子树，若节点 value 为空则调用 LLM 补全（上下文包含宏观总结 + 其他父节点 key 列表 + 直接父节点 value）。
 
 ### 提示词生成（WorldPromptBuilder）
@@ -36,6 +37,7 @@ from world.world_engine import WorldEngine
 
 engine = WorldEngine(
     user_pitch="一个漂浮空岛组成的蒸汽朋克世界，能源匮乏。",
+    micro_scale="medium",
     auto_generate=True,
 )
 
@@ -49,4 +51,4 @@ engine.add_child("2", "4", "未来冲突")
 ## 环境配置
 - 需要 `.env` 或系统变量提供：`OPENAI_API_KEY`（必需）、`OPENAI_BASE_URL`（可选）、`OPENAI_MODEL`（可选，默认 `gpt-3.5-turbo`）。
 - 如需注入自定义 LLM 客户端，可在初始化时传入 `llm_client` 参数；测试用可传入伪造的 `chat_once` 实现，避免真实请求。
-- `test_world.py` 提供交互式流程：输入世界观设定并生成示例快照。
+- `test/test_world.py` 提供交互式流程：输入世界观设定并生成示例快照。

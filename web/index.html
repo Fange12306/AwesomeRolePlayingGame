@@ -49,6 +49,14 @@
             <span>世界初稿</span>
             <textarea id="world-prompt" rows="5" placeholder="例：一片漂浮于恒星风暴中的群岛文明，科技靠共振水晶驱动。"></textarea>
           </label>
+          <label class="field">
+            <span>世界规模（仅影响微观节点数量）</span>
+            <select id="world-size">
+              <option value="small">小</option>
+              <option value="medium" selected>中</option>
+              <option value="large">大</option>
+            </select>
+          </label>
           <div class="actions">
             <button id="btn-generate" class="btn primary">生成世界</button>
             <input id="world-file" type="file" accept="application/json" />

@@ -17,6 +17,11 @@ from world.world_prompt import (
 DEFAULT_SPEC_PATH = Path(__file__).resolve().parent / "world_spec.md"
 DEFAULT_LOG_PATH = Path("log") / "world_engine.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(message)s"
+MICRO_SCALE_PRESETS = {
+    "small": {"regions": (2, 3), "polities": (2, 3)},
+    "medium": {"regions": (3, 5), "polities": (3, 5)},
+    "large": {"regions": (5, 7), "polities": (5, 7)},
+}
 
 
 def _truncate_text(text: str, limit: int = 800) -> str:
@@ -63,6 +68,7 @@ class WorldEngine:
         world_spec_text: Optional[str] = None,
         user_pitch: Optional[str] = None,
         llm_client: Optional[LLMClient] = None,
+        micro_scale: str = "medium",
         auto_generate: bool = True,
         progress_callback: Optional[Callable[[WorldNode, int, int], None]] = None,
         max_retries: int = 2,
@@ -93,14 +99,16 @@ class WorldEngine:
             )
             raise
         self.user_pitch = user_pitch or ""
+        self.micro_scale = self._normalize_micro_scale(micro_scale)
         self.max_retries = max_retries
         self.macro_summary = ""
         if self.user_pitch:
             self.root.value = self.user_pitch
 
         self.logger.info(
-            "init world_engine auto_generate=%s user_pitch_len=%s",
+            "init world_engine auto_generate=%s micro_scale=%s user_pitch_len=%s",
             auto_generate,
+            self.micro_scale,
             len(self.user_pitch),
         )
 
@@ -405,33 +413,40 @@ class WorldEngine:
         summary = macro_summary.strip() or self._build_macro_outline(skip_empty=True)
         if not summary:
             summary = "无"
+        region_range, polity_range = self._get_micro_scale_ranges()
+        region_min, region_max = region_range
         region_names = self._generate_name_list(
             prompt_builder=lambda retry_note="": WorldPromptBuilder.build_region_list_prompt(
                 user_pitch=self.user_pitch,
                 macro_summary=summary,
-                min_count=2,
-                max_count=7,
+                min_count=region_min,
+                max_count=region_max,
                 retry_note=retry_note,
             ),
             log_label="MICRO_REGIONS",
             retries=retries,
+            min_count=region_min,
+            max_count=region_max,
         )
 
         for index, region_name in enumerate(region_names, start=1):
             region_key = f"r{index}"
             region_node = self.add_child("micro", region_key, region_name)
+            polity_min, polity_max = polity_range
             polity_names = self._generate_name_list(
                 prompt_builder=lambda retry_note="", region=region_name, regions=region_names: WorldPromptBuilder.build_polity_list_prompt(
                     user_pitch=self.user_pitch,
                     macro_summary=summary,
                     region_key=region,
                     all_regions=regions,
-                    min_count=2,
-                    max_count=7,
+                    min_count=polity_min,
+                    max_count=polity_max,
                     retry_note=retry_note,
                 ),
                 log_label=f"MICRO_POLITIES_{region_key}",
                 retries=retries,
+                min_count=polity_min,
+                max_count=polity_max,
             )
             for polity_index, polity_name in enumerate(polity_names, start=1):
                 polity_key = f"p{polity_index}"
@@ -444,8 +459,11 @@ class WorldEngine:
         prompt_builder: Callable[[str], str],
         log_label: str,
         retries: int,
+        min_count: int = 2,
+        max_count: int = 7,
     ) -> List[str]:
         last_error = ""
+        fallback_names: List[str] = []
         for attempt in range(retries + 1):
             prompt = prompt_builder(last_error if attempt > 0 else "")
             response = self._chat_once(
@@ -454,7 +472,7 @@ class WorldEngine:
                 log_label=log_label if attempt == 0 else f"{log_label}_RETRY_{attempt}",
             )
             try:
-                return self._parse_name_list(response)
+                names = self._parse_name_list(response)
             except ValueError as exc:
                 last_error = str(exc)
                 self.logger.warning(
@@ -465,6 +483,24 @@ class WorldEngine:
                     _truncate_text(response),
                 )
                 continue
+            if len(names) < min_count or len(names) > max_count:
+                last_error = f"invalid_count:{len(names)}"
+                fallback_names = names
+                self.logger.warning(
+                    "parse_name_list count out of range label=%s attempt=%s count=%s target=%s-%s response=%s",
+                    log_label,
+                    attempt,
+                    len(names),
+                    min_count,
+                    max_count,
+                    _truncate_text(response),
+                )
+                continue
+            return names
+        if fallback_names:
+            if len(fallback_names) > max_count:
+                return fallback_names[:max_count]
+            return fallback_names
         raise ValueError(f"Unable to parse name list for {log_label}: {last_error}")
 
     def _parse_name_list(self, response: str) -> List[str]:
@@ -536,6 +572,16 @@ class WorldEngine:
 
         dfs(self.micro, 0)
         return "\n".join(lines) if lines else "无"
+
+    def _normalize_micro_scale(self, micro_scale: str) -> str:
+        scale = str(micro_scale or "").strip().lower()
+        if scale in MICRO_SCALE_PRESETS:
+            return scale
+        return "medium"
+
+    def _get_micro_scale_ranges(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        preset = MICRO_SCALE_PRESETS.get(self.micro_scale, MICRO_SCALE_PRESETS["medium"])
+        return preset["regions"], preset["polities"]
 
     def _build_micro_value_prompt(self, node: WorldNode) -> str:
         macro_summary = self.macro_summary.strip() or self._build_macro_outline(skip_empty=True)

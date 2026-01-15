@@ -10,6 +10,7 @@ const navButtons = Array.from(document.querySelectorAll(".nav-btn"));
 const appPages = Array.from(document.querySelectorAll(".app-page"));
 
 const promptInput = document.getElementById("world-prompt");
+const worldSizeSelect = document.getElementById("world-size");
 const generateBtn = document.getElementById("btn-generate");
 const importBtn = document.getElementById("btn-import");
 const fileInput = document.getElementById("world-file");
@@ -29,6 +30,9 @@ let pollTimer = null;
 let characterPollTimer = null;
 let latestWorldSavePath = "";
 let worldStageReady = false;
+let updateTimer = null;
+let lastWorldRevision = 0;
+let lastCharacterRevision = 0;
 
 function showScreen(name) {
   Object.entries(screens).forEach(([key, node]) => {
@@ -90,6 +94,10 @@ async function startGeneration() {
     setProgressMessage("请先输入一句世界初稿。");
     return;
   }
+  const scaleValue = worldSizeSelect?.value || "medium";
+  const scale = ["small", "medium", "large"].includes(scaleValue)
+    ? scaleValue
+    : "medium";
   generateBtn.disabled = true;
   importBtn.disabled = true;
   setProgress(0, 1);
@@ -99,7 +107,7 @@ async function startGeneration() {
     const response = await fetch("/api/generate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, scale }),
     });
     const data = await response.json();
     if (!data.ok) {
@@ -342,6 +350,53 @@ function pollCharacterProgress(jobId, total) {
   }, 600);
 }
 
+async function pollUpdates() {
+  try {
+    const response = await fetch("/api/updates");
+    const data = await response.json();
+    if (!data.ok) {
+      return;
+    }
+    if (typeof data.world_revision === "number") {
+      if (data.world_revision !== lastWorldRevision) {
+        lastWorldRevision = data.world_revision;
+        if (data.world_save_path) {
+          latestWorldSavePath = data.world_save_path;
+        }
+        if (window.WorldView) {
+          if (window.WorldView.requestRefresh) {
+            window.WorldView.requestRefresh();
+          } else if (window.WorldView.load) {
+            window.WorldView.load();
+          }
+        }
+      }
+    }
+    if (typeof data.character_revision === "number") {
+      if (data.character_revision !== lastCharacterRevision) {
+        lastCharacterRevision = data.character_revision;
+        if (window.CharacterView) {
+          if (data.character_save_path && window.CharacterView.loadLatest) {
+            window.CharacterView.loadLatest(data.character_save_path);
+          } else if (window.CharacterView.load) {
+            window.CharacterView.load();
+          }
+        }
+      }
+    }
+  } catch (error) {
+    // Ignore polling failures.
+  }
+}
+
+function startUpdatePolling() {
+  if (updateTimer) {
+    return;
+  }
+  updateTimer = setInterval(pollUpdates, 1000);
+  pollUpdates();
+}
+
 navButtons.forEach((btn) => {
   btn.addEventListener("click", () => showPage(btn.dataset.page));
 });
@@ -394,3 +449,4 @@ if (window.AgentTestView) {
 
 showScreen("landing");
 showPage("home");
+startUpdatePolling();

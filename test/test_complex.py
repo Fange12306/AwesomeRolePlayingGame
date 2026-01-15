@@ -392,6 +392,19 @@ def summarize_results(title: str, results: List[TestResult]) -> None:
             print(f"   actual: {actual}")
 
 
+def _has_world_updates(result: GameUpdateResult) -> bool:
+    nodes = result.world_nodes or ([result.world_node] if result.world_node else [])
+    return any(node and node.value.strip() for node in nodes)
+
+
+def _has_character_updates(result: GameUpdateResult) -> bool:
+    records = (
+        result.character_records
+        or ([result.character_record] if result.character_record else [])
+    )
+    return any(record and str(record.profile).strip() for record in records)
+
+
 def run_case(
     case: ComplexCase,
     world_snapshot: Path,
@@ -443,7 +456,7 @@ def run_case(
         )
 
     if case.expect_world:
-        if not result.world_node or not result.world_node.value.strip():
+        if not _has_world_updates(result):
             detail = f"world_update_empty; {detail}"
             return TestResult(
                 case.name,
@@ -455,7 +468,7 @@ def run_case(
             )
 
     if case.expect_characters:
-        if not result.character_record or not str(result.character_record.profile).strip():
+        if not _has_character_updates(result):
             detail = f"character_update_empty; {detail}"
             return TestResult(
                 case.name,

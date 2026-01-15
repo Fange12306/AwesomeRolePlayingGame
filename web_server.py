@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -180,6 +181,20 @@ def _format_save_path(path: Optional[Path]) -> str:
         return str(path)
 
 
+def _mark_world_updated(save_path: Optional[Path]) -> None:
+    STATE.world_revision += 1
+    STATE.world_updated_at = time.time()
+    if save_path:
+        STATE.current_save = save_path
+
+
+def _mark_character_updated(save_path: Optional[Path]) -> None:
+    STATE.character_revision += 1
+    STATE.character_updated_at = time.time()
+    if save_path:
+        STATE.last_character_save = save_path
+
+
 def _load_world_snapshot() -> tuple[Optional[Dict[str, Dict[str, Any]]], Optional[Path]]:
     with STATE.lock:
         snapshot = STATE.snapshot
@@ -294,12 +309,19 @@ class AppState:
         self.current_save: Optional[Path] = None
         self.jobs: Dict[str, GenerationJob] = {}
         self.world_job_id: Optional[str] = None
+        self.world_revision: int = 0
+        self.character_revision: int = 0
+        self.world_updated_at: float = 0.0
+        self.character_updated_at: float = 0.0
+        self.last_character_save: Optional[Path] = None
 
 
 STATE = AppState()
 
 
 class RequestHandler(SimpleHTTPRequestHandler):
+    logger = LOGGER
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
         self.logger = LOGGER
@@ -422,6 +444,19 @@ class RequestHandler(SimpleHTTPRequestHandler):
             }
             self._send_json(payload)
             return
+        if parsed.path == "/api/updates":
+            with STATE.lock:
+                payload = {
+                    "ok": True,
+                    "world_revision": STATE.world_revision,
+                    "character_revision": STATE.character_revision,
+                    "world_updated_at": STATE.world_updated_at,
+                    "character_updated_at": STATE.character_updated_at,
+                    "world_save_path": _format_save_path(STATE.current_save),
+                    "character_save_path": _format_save_path(STATE.last_character_save),
+                }
+            self._send_json(payload)
+            return
         if parsed.path == "/api/world/snapshots":
             snapshots = _list_world_snapshots()
             self._send_json({"ok": True, "snapshots": snapshots})
@@ -520,6 +555,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
 
     def _handle_generate(self, payload: Dict[str, Any]) -> None:
         prompt = str(payload.get("prompt", "")).strip()
+        scale = str(payload.get("scale", "")).strip().lower()
         if not prompt:
             self._send_json({"ok": False, "error": "missing_prompt"}, status=400)
             return
@@ -552,6 +588,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
                     job.save_path = str(save_path)
                     STATE.snapshot = snapshot
                     STATE.current_save = save_path
+                    _mark_world_updated(save_path)
 
             def progress_cb(node, completed: int, total: int) -> None:
                 with STATE.lock:
@@ -567,6 +604,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
                 engine = WorldEngine(
                     world_spec_path=str(WORLD_SPEC),
                     user_pitch=prompt,
+                    micro_scale=scale,
                     auto_generate=False,
                 )
                 macro_total = len(engine._iter_macro_nodes())
@@ -595,6 +633,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
                     job.message = "生成完成"
                     STATE.snapshot = snapshot
                     STATE.current_save = save_path
+                    _mark_world_updated(save_path)
             except Exception as exc:
                 self.logger.exception(
                     "generate_world failed job_id=%s prompt_len=%s save_path=%s",
@@ -674,6 +713,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
                         f"完成：角色 {len(records)} / 关系 {len(relations)} "
                         f"/ 地点关系 {len(location_edges)}"
                     )
+                    _mark_character_updated(save_path)
             except Exception as exc:
                 self.logger.exception(
                     "generate_characters failed job_id=%s total=%s snapshot_path=%s",
@@ -715,6 +755,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
             _write_snapshot(snapshot, save_path)
             STATE.snapshot = snapshot
             STATE.current_save = save_path
+            _mark_world_updated(save_path)
 
         self._send_json({"ok": True, "save_path": str(save_path)})
 
@@ -752,8 +793,10 @@ class RequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "node_not_found"}, status=404)
                 return
             node["value"] = value
-            if STATE.current_save:
-                _write_snapshot(STATE.snapshot, STATE.current_save)
+            if not STATE.current_save:
+                STATE.current_save = SAVE_ROOT / "world" / f"world_{_timestamp()}.json"
+            _write_snapshot(STATE.snapshot, STATE.current_save)
+            _mark_world_updated(STATE.current_save)
 
         self._send_json({"ok": True})
 
@@ -829,12 +872,13 @@ class RequestHandler(SimpleHTTPRequestHandler):
             world_save_path = snapshot_path
             character_save_path = character_snapshot_path
             if decision.update_world:
-                world_decision = world_agent.decide_action(text)
-                node_label = ""
+                if hasattr(world_agent, "collect_actions"):
+                    world_decisions = world_agent.collect_actions(text)
+                else:
+                    world_decisions = world_agent.decide_actions(text)
+                world_nodes: list[WorldNode] = []
                 if apply_updates:
-                    world_node = world_agent.apply_update(
-                        world_decision.flag, world_decision.index, text
-                    )
+                    world_nodes = world_agent.apply_updates(world_decisions, text)
                     current_snapshot = world_engine.as_dict()
                     if not world_save_path:
                         world_save_path = SAVE_ROOT / f"world_{_timestamp()}.json"
@@ -842,56 +886,79 @@ class RequestHandler(SimpleHTTPRequestHandler):
                     with STATE.lock:
                         STATE.snapshot = current_snapshot
                         STATE.current_save = world_save_path
+                        _mark_world_updated(world_save_path)
                     applied["world"] = True
-                    node_label = world_node.key if world_node else ""
-                else:
-                    node = world_engine.view_node(world_decision.index)
-                    node_label = node.key
-                actions.append(
-                    {
-                        "agent": "world",
-                        "action": _normalize_action_name(world_decision.flag),
-                        "target": world_decision.index,
-                        "label": node_label,
-                    }
-                )
+                for idx, world_decision in enumerate(world_decisions):
+                    node_label = ""
+                    if apply_updates:
+                        node = world_nodes[idx] if idx < len(world_nodes) else None
+                        node_label = node.key if node else ""
+                    else:
+                        node = world_engine.view_node(world_decision.index)
+                        node_label = node.key
+                    actions.append(
+                        {
+                            "agent": "world",
+                            "action": _normalize_action_name(world_decision.flag),
+                            "target": world_decision.index,
+                            "label": node_label,
+                        }
+                    )
                 if apply_updates:
                     character_engine.set_world_snapshot(current_snapshot)
                     character_engine.world_snapshot_path = world_save_path
             if decision.update_characters:
+                if hasattr(character_agent, "collect_actions"):
+                    character_decisions = character_agent.collect_actions(text)
+                else:
+                    character_decisions = character_agent.decide_actions(text)
                 label = ""
-                character_decision = character_agent.decide_action(text)
                 if current_snapshot:
                     character_engine.set_world_snapshot(current_snapshot)
                 if world_save_path:
                     character_engine.world_snapshot_path = world_save_path
+                character_records: list[CharacterRecord] = []
                 if apply_updates:
-                    character_record = character_agent.apply_update(
-                        character_decision.flag, character_decision.identifier, text
+                    character_records = character_agent.apply_updates(
+                        character_decisions, text
                     )
-                    if isinstance(character_record.profile, dict):
-                        label = str(character_record.profile.get("name", "")).strip()
+                    if character_records:
+                        record = character_records[-1]
+                        if isinstance(record.profile, dict):
+                            label = str(record.profile.get("name", "")).strip()
                     character_save_path = character_save_path or (
                         SAVE_ROOT / "characters" / f"characters_{_timestamp()}.json"
                     )
                     character_engine.save_snapshot(
                         character_save_path, character_engine.records
                     )
+                    with STATE.lock:
+                        _mark_character_updated(character_save_path)
                     applied["character"] = True
-                else:
-                    for record in character_engine.records:
-                        if record.identifier == character_decision.identifier:
-                            if isinstance(record.profile, dict):
-                                label = str(record.profile.get("name", "")).strip()
-                            break
-                actions.append(
-                    {
-                        "agent": "character",
-                        "action": _normalize_action_name(character_decision.flag),
-                        "target": character_decision.identifier,
-                        "label": label,
-                    }
-                )
+                for idx, character_decision in enumerate(character_decisions):
+                    label = ""
+                    if apply_updates:
+                        record = (
+                            character_records[idx]
+                            if idx < len(character_records)
+                            else None
+                        )
+                        if record and isinstance(record.profile, dict):
+                            label = str(record.profile.get("name", "")).strip()
+                    else:
+                        for record in character_engine.records:
+                            if record.identifier == character_decision.identifier:
+                                if isinstance(record.profile, dict):
+                                    label = str(record.profile.get("name", "")).strip()
+                                break
+                    actions.append(
+                        {
+                            "agent": "character",
+                            "action": _normalize_action_name(character_decision.flag),
+                            "target": character_decision.identifier,
+                            "label": label,
+                        }
+                    )
 
             response = {
                 "ok": True,

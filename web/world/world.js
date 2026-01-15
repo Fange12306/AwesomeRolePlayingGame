@@ -8,6 +8,7 @@ const WorldView = (() => {
   let collapseInitialized = { macro: false, micro: false };
   let isEditing = false;
   let isLocked = false;
+  let refreshQueued = false;
   let statusTimer = null;
 
   function init(config) {
@@ -456,6 +457,9 @@ const WorldView = (() => {
       updatePreview(elements.detailTextarea?.value || "");
     }
     updateDetailMode();
+    if (!isEditing) {
+      flushQueuedRefresh();
+    }
     if (isEditing && elements.detailTextarea) {
       elements.detailTextarea.focus();
       elements.detailTextarea.selectionStart = elements.detailTextarea.value.length;
@@ -655,12 +659,35 @@ const WorldView = (() => {
       setStatus("已保存修改。", false);
     } catch (error) {
       setStatus(`保存失败：${error.message}`, true);
+    } finally {
+      flushQueuedRefresh();
     }
+  }
+
+  function canReload() {
+    return !isEditing && pendingSaves.size === 0;
+  }
+
+  function flushQueuedRefresh() {
+    if (!refreshQueued || !canReload()) {
+      return;
+    }
+    refreshQueued = false;
+    load();
+  }
+
+  function requestRefresh() {
+    if (canReload()) {
+      load();
+      return;
+    }
+    refreshQueued = true;
   }
 
   return {
     init,
     load,
+    requestRefresh,
   };
 })();
 

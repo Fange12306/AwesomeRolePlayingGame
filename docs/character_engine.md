@@ -79,4 +79,4 @@ engine.save_snapshot("save/characters/characters_20240101_120000.json")
 
 ## 环境配置
 - 依赖 `.env` 或系统变量：`OPENAI_API_KEY`（必需）、`OPENAI_BASE_URL`（可选）、`OPENAI_MODEL`（可选，默认 `gpt-3.5-turbo`）。
-- `test_character.py` 提供交互式流程：选择世界快照、输入角色数量与角色总概况。
+- `test/test_character.py` 提供交互式流程：选择世界快照、输入角色数量与角色总概况。

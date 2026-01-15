@@ -190,8 +190,12 @@ const AgentTestView = (() => {
   function refreshViews(applied) {
     const shouldRefreshWorld = !applied || applied.world;
     const shouldRefreshCharacter = !applied || applied.character;
-    if (shouldRefreshWorld && window.WorldView && window.WorldView.load) {
-      window.WorldView.load();
+    if (shouldRefreshWorld && window.WorldView) {
+      if (window.WorldView.requestRefresh) {
+        window.WorldView.requestRefresh();
+      } else if (window.WorldView.load) {
+        window.WorldView.load();
+      }
     }
     if (shouldRefreshCharacter && window.CharacterView && window.CharacterView.load) {
       window.CharacterView.load();

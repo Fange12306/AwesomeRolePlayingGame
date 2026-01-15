@@ -15,6 +15,7 @@ ADD_TAG = "<|ADD_NODE|>"
 UPDATE_TAG = "<|UPDATE_NODE|>"
 DEFAULT_LOG_PATH = Path("log") / "world_agent.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(message)s"
+DEFAULT_MAX_ACTIONS = 3
 
 
 def _truncate_text(text: str, limit: int = 800) -> str:
@@ -80,34 +81,113 @@ class WorldAgent:
             raise
 
     def decide_action(self, update_info: str) -> ActionDecision:
+        decisions = self.decide_actions(update_info)
+        if len(decisions) > 1:
+            self.logger.info("decide_action picked first action total=%s", len(decisions))
+        return decisions[0]
+
+    def decide_actions(
+        self, update_info: str, max_actions: int = DEFAULT_MAX_ACTIONS
+    ) -> list[ActionDecision]:
         response = ""
         try:
-            prompt = self._build_decision_prompt(update_info)
+            prompt = self._build_decision_prompt(update_info, max_actions=max_actions)
             response = self._chat_once(
                 prompt, system_prompt=self._system_prompt(), log_label="DECIDE"
             )
-            flag, index = self._parse_decision(response)
-            if index not in self.engine.nodes:
-                raise ValueError(f"Node {index} not found for decision")
+            parsed = self._parse_decisions(response)
+            decisions: list[ActionDecision] = []
+            seen: set[tuple[str, str]] = set()
+            for flag, index in parsed:
+                normalized = self._normalize_flag(flag)
+                cleaned_index = self._clean_index(index)
+                if not cleaned_index:
+                    continue
+                resolved = None
+                if normalized == ADD_TAG:
+                    if (
+                        self._is_micro_aspect_index(cleaned_index)
+                        and cleaned_index not in self.engine.nodes
+                    ):
+                        parent_id = cleaned_index.rsplit(".", 1)[0]
+                        if parent_id not in self.engine.nodes:
+                            continue
+                    resolved = self._resolve_add_parent(cleaned_index)
+                elif normalized == UPDATE_TAG:
+                    resolved = self._resolve_update_index(cleaned_index, update_info)
+                if not resolved:
+                    continue
+                if normalized == ADD_TAG:
+                    parent = self.engine.view_node(resolved)
+                    if self._is_macro_branch(parent):
+                        normalized = UPDATE_TAG
+                key = (normalized, resolved)
+                if key in seen:
+                    continue
+                decisions.append(
+                    ActionDecision(flag=normalized, index=resolved, raw=response)
+                )
+                seen.add(key)
+                if len(decisions) >= max_actions:
+                    break
+            if not decisions:
+                raise ValueError("No valid decisions parsed from response")
             self.logger.info(
-                "decide_action flag=%s index=%s info_len=%s",
-                flag,
-                index,
-                len(update_info),
+                "decide_actions count=%s info_len=%s", len(decisions), len(update_info)
             )
-            return ActionDecision(flag=flag, index=index, raw=response)
+            return decisions
         except Exception:
             self.logger.exception(
-                "decide_action failed info_len=%s response=%s",
+                "decide_actions failed info_len=%s response=%s",
                 len(update_info),
                 _truncate_text(response),
             )
             raise
 
+    def collect_actions(
+        self, update_info: str, max_actions: Optional[int] = None
+    ) -> list[ActionDecision]:
+        candidate_indices = self._extract_candidate_indices(update_info)
+        candidate_count = len({item for item in candidate_indices if item})
+        llm_limit = max_actions
+        if llm_limit is None:
+            llm_limit = max(DEFAULT_MAX_ACTIONS, min(8, candidate_count)) or DEFAULT_MAX_ACTIONS
+        decisions: list[ActionDecision] = []
+        try:
+            decisions = self.decide_actions(
+                update_info, max_actions=llm_limit
+            )
+        except Exception:
+            self.logger.warning(
+                "collect_actions fallback to heuristics info_len=%s",
+                len(update_info),
+            )
+        inferred = self._infer_actions_from_text(update_info)
+        combined: list[ActionDecision] = []
+        seen: set[tuple[str, str]] = set()
+        for action in decisions + inferred:
+            key = (action.flag, action.index)
+            if key in seen:
+                continue
+            combined.append(action)
+            seen.add(key)
+            if max_actions is not None and len(combined) >= max_actions:
+                break
+        if not combined:
+            raise ValueError("No valid actions collected from response or heuristics")
+        return combined
+
     def apply_update(self, flag: str, index: str, update_info: str) -> WorldNode:
         try:
             normalized = self._normalize_flag(flag)
             if normalized == ADD_TAG:
+                parent = self.engine.view_node(index)
+                if self._is_macro_branch(parent):
+                    node = self._apply_update(index, update_info)
+                    self.logger.info(
+                        "apply_update update index=%s (macro add suppressed)", index
+                    )
+                    return node
                 node = self._apply_add(index, update_info)
                 self.logger.info(
                     "apply_update add parent=%s child=%s", index, node.identifier
@@ -126,6 +206,15 @@ class WorldAgent:
                 len(update_info),
             )
             raise
+
+    def apply_updates(
+        self, actions: Iterable[ActionDecision], update_info: str
+    ) -> list[WorldNode]:
+        nodes: list[WorldNode] = []
+        for action in actions:
+            node = self.apply_update(action.flag, action.index, update_info)
+            nodes.append(node)
+        return nodes
 
     def add_polity(self, region_identifier: str, polity_name: str) -> WorldNode:
         try:
@@ -201,14 +290,18 @@ class WorldAgent:
                 return identifier
         return None
 
-    def _build_decision_prompt(self, update_info: str) -> str:
+    def _build_decision_prompt(
+        self, update_info: str, max_actions: int = DEFAULT_MAX_ACTIONS
+    ) -> str:
         lines = [
             "【任务】判断更新操作",
             "你需要决定是新增节点还是修改节点。",
+            "宏观设定(Macro树)禁止新增节点，只能修改节点内容。",
+            f"如果涉及多个节点，最多输出 {max_actions} 条操作。",
             "输出必须包含两处冗余，且只输出两行：",
-            f"1) {ADD_TAG}:INDEX 或 {UPDATE_TAG}:INDEX",
-            '2) {"action":"ADD_NODE"|"UPDATE_NODE","index":"INDEX"}',
-            "INDEX 必须是已有节点的标识。",
+            f"1) {ADD_TAG}:INDEX 或 {UPDATE_TAG}:INDEX (多条用逗号分隔)",
+            '2) [{"action":"ADD_NODE"|"UPDATE_NODE","index":"INDEX"}, ...]',
+            "INDEX 必须是已有父节点的标识，ADD 时不要输出新节点 ID 或子路径。",
             f"剧情信息：{update_info.strip()}",
             "可用节点：",
         ]
@@ -232,18 +325,30 @@ class WorldAgent:
         parent_content = (parent.value or "").strip() or "无"
         siblings = [child.key for child in parent.children.values()]
         sibling_text = "、".join(siblings) if siblings else "无"
-        return "\n".join(
-            [
+        if self._is_micro_branch(parent):
+            lines = [
+                "【任务】新增子节点内容",
+                "输出格式如下，可按顺序重复多组：",
+                "<|KEY|>:新节点名称",
+                "<|VALUE|>:新节点内容",
+                "如需连续创建多层节点，请从上到下依次输出多组，后一组父节点为前一组新节点。",
+            ]
+        else:
+            lines = [
                 "【任务】新增子节点内容",
                 "只输出两行，格式如下：",
                 "<|KEY|>:新节点名称",
                 "<|VALUE|>:新节点内容",
+            ]
+        lines.extend(
+            [
                 f"父节点：{parent.identifier} {parent.key}",
                 f"父节点内容：{parent_content}",
                 f"已有子节点名称：{sibling_text}",
                 f"剧情信息：{update_info.strip()}",
             ]
         )
+        return "\n".join(lines)
 
     # Core actions --------------------------------------------------------
     def _apply_update(self, index: str, update_info: str) -> WorldNode:
@@ -262,11 +367,24 @@ class WorldAgent:
         response = self._chat_once(
             prompt, system_prompt=self._system_prompt(), log_label="ADD_NODE"
         )
-        key, content = self._parse_key_and_value(response, update_info)
-        child_key = self._choose_child_key(parent)
-        node = self.engine.add_child(parent.identifier, child_key, key)
-        node.value = content
-        return node
+        pairs = self._parse_key_and_values(response, update_info)
+        if not self._is_micro_branch(parent):
+            pairs = pairs[:1]
+        current_parent = parent
+        last_node: Optional[WorldNode] = None
+        for idx, (key, content) in enumerate(pairs):
+            child_key = self._choose_child_key(current_parent)
+            node = self.engine.add_child(current_parent.identifier, child_key, key)
+            if content:
+                node.value = content
+            if self._is_micro_region(current_parent):
+                remaining_keys = [item[0] for item in pairs[idx + 1 :]]
+                self._maybe_seed_polity_aspects(node, remaining_keys)
+            last_node = node
+            current_parent = node
+        if not last_node:
+            raise ValueError("No node created for add action")
+        return last_node
 
     # Helpers -------------------------------------------------------------
     def _iter_nodes(self) -> Iterable[WorldNode]:
@@ -314,6 +432,123 @@ class WorldAgent:
             f"Multiple polities named {polity_identifier}; specify region_identifier"
         )
 
+    def _clean_index(self, index: str) -> str:
+        return index.strip().strip(",;")
+
+    def _resolve_add_parent(self, index: str) -> Optional[str]:
+        candidate = self._clean_index(index)
+        if not candidate:
+            return None
+        if candidate in self.engine.nodes:
+            return candidate
+        if self._is_micro_aspect_index(candidate):
+            parent_id = candidate.rsplit(".", 1)[0]
+            if parent_id in self.engine.nodes:
+                return None
+        parent_id = candidate
+        while parent_id:
+            if parent_id in self.engine.nodes:
+                return parent_id
+            if "." not in parent_id:
+                break
+            parent_id = parent_id.rsplit(".", 1)[0]
+        lowered = candidate.lower()
+        if lowered.startswith("micro") and "micro" in self.engine.nodes:
+            return "micro"
+        if lowered.startswith("macro") and "macro" in self.engine.nodes:
+            return "macro"
+        if lowered.startswith("world") and "world" in self.engine.nodes:
+            return "world"
+        return None
+
+    def _resolve_update_index(self, index: str, update_info: str) -> Optional[str]:
+        candidate = self._clean_index(index)
+        if candidate in self.engine.nodes:
+            return candidate
+        key_match = self._match_node_by_key(candidate)
+        if key_match:
+            return key_match
+        for identifier in self.engine.nodes:
+            if identifier and identifier in candidate:
+                return identifier
+        return self._match_node_in_text(update_info)
+
+    def _match_node_by_key(self, key_text: str) -> Optional[str]:
+        cleaned = key_text.strip()
+        if not cleaned:
+            return None
+        matches = [
+            node.identifier
+            for node in self.engine.nodes.values()
+            if node.key.strip() == cleaned
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _match_node_in_text(self, text: str) -> Optional[str]:
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+        candidates: list[str] = []
+        candidates.extend(
+            re.findall(r"\bmicro(?:\.[A-Za-z0-9_]+)+\b", cleaned)
+        )
+        candidates.extend(re.findall(r"\b\d+(?:\.\d+)+\b", cleaned))
+        for candidate in sorted(candidates, key=len, reverse=True):
+            if candidate in self.engine.nodes:
+                return candidate
+        key_matches = [
+            node.identifier
+            for node in self.engine.nodes.values()
+            if node.key.strip() and node.key.strip() in cleaned
+        ]
+        if len(set(key_matches)) == 1:
+            return key_matches[0]
+        return None
+
+    def _is_micro_aspect_index(self, identifier: str) -> bool:
+        if not identifier.startswith("micro."):
+            return False
+        parts = identifier.split(".")
+        if len(parts) < 4:
+            return False
+        aspect_id = parts[-1]
+        return any(aspect_id == aspect for aspect, _ in MICRO_POLITY_ASPECTS)
+
+    def _infer_actions_from_text(self, update_info: str) -> list[ActionDecision]:
+        candidates = self._extract_candidate_indices(update_info)
+        actions: list[ActionDecision] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            resolved = self._resolve_update_index(candidate, update_info)
+            if not resolved or resolved in seen:
+                continue
+            actions.append(
+                ActionDecision(flag=UPDATE_TAG, index=resolved, raw="heuristic")
+            )
+            seen.add(resolved)
+        return actions
+
+    def _extract_candidate_indices(self, update_info: str) -> list[str]:
+        candidates: list[str] = []
+        text = update_info.strip()
+        if not text:
+            return candidates
+        candidates.extend(re.findall(r"\bmicro(?:\.[A-Za-z0-9_]+)+\b", text))
+        candidates.extend(re.findall(r"\b\d+(?:\.\d+)+\b", text))
+        skip_keys = {aspect_key for _, aspect_key in MICRO_POLITY_ASPECTS}
+        skip_keys.update({"World", "Macro", "Micro"})
+        for node in self.engine.nodes.values():
+            key = node.key.strip()
+            if not key or key in skip_keys:
+                continue
+            if len(key) < 2:
+                continue
+            if key in text:
+                candidates.append(node.identifier)
+        return candidates
+
     def _require_micro_region(self, region: WorldNode) -> None:
         if region.identifier == "micro":
             raise ValueError("Region identifier must not be micro root")
@@ -334,13 +569,38 @@ class WorldAgent:
         return candidate
 
     def _parse_decision(self, response: str) -> tuple[str, str]:
-        tag_match = re.search(
-            r"<\|(ADD_NODE|UPDATE_NODE)\|>\s*[:：]\s*([^\s]+)",
+        decisions = self._parse_decisions(response)
+        if not decisions:
+            raise ValueError(f"Unable to parse decision from response: {response}")
+        return decisions[0]
+
+    def _parse_decisions(self, response: str) -> list[tuple[str, str]]:
+        actions: list[tuple[str, str]] = []
+        for match in re.finditer(
+            r"<\|(ADD_NODE|UPDATE_NODE)\|>\s*[:：]\s*([^\s,;]+)",
             response,
-        )
-        if tag_match:
-            flag = f"<|{tag_match.group(1)}|>"
-            return flag, tag_match.group(2).strip()
+        ):
+            flag = f"<|{match.group(1)}|>"
+            index = match.group(2).strip()
+            if index:
+                actions.append((flag, index))
+
+        bracket_start = response.find("[")
+        bracket_end = response.rfind("]")
+        if bracket_start >= 0 and bracket_end > bracket_start:
+            fragment = response[bracket_start : bracket_end + 1]
+            try:
+                data = json.loads(fragment)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    action = str(item.get("action", "")).strip().upper()
+                    index = str(item.get("index", "")).strip()
+                    if action in {"ADD_NODE", "UPDATE_NODE"} and index:
+                        actions.append((f"<|{action}|>", index))
 
         for match in re.finditer(r"\{.*?\}", response, flags=re.DOTALL):
             try:
@@ -350,37 +610,63 @@ class WorldAgent:
             action = str(data.get("action", "")).strip().upper()
             index = str(data.get("index", "")).strip()
             if action in {"ADD_NODE", "UPDATE_NODE"} and index:
-                return f"<|{action}|>", index
+                actions.append((f"<|{action}|>", index))
 
-        raise ValueError(f"Unable to parse decision from response: {response}")
+        return actions
 
-    def _parse_key_and_value(
+    def _parse_key_and_values(
         self, response: str, update_info: str
-    ) -> tuple[str, str]:
-        key = None
+    ) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        current_key: Optional[str] = None
         content_lines: list[str] = []
         capture_content = False
+
+        def finalize() -> None:
+            nonlocal current_key, content_lines, capture_content
+            if current_key is None:
+                return
+            content = "\n".join(line for line in content_lines if line).strip()
+            entries.append((current_key.strip(), content))
+            current_key = None
+            content_lines = []
+            capture_content = False
+
         for line in response.splitlines():
             key_match = re.match(r"<\|KEY\|>\s*[:：]?\s*(.*)", line)
-            if key_match and key is None:
-                key = key_match.group(1).strip()
+            if key_match:
+                if current_key is not None:
+                    finalize()
+                current_key = key_match.group(1).strip()
                 continue
             content_match = re.match(r"<\|VALUE\|>\s*[:：]?\s*(.*)", line)
             if content_match:
                 capture_content = True
                 content_lines.append(content_match.group(1).strip())
                 continue
-            if capture_content:
+            if capture_content and current_key is not None:
                 content_lines.append(line.strip())
 
-        content = "\n".join(line for line in content_lines if line).strip()
-        if not content:
-            content = response.strip()
+        if current_key is not None:
+            finalize()
 
-        if not key:
-            key = self._infer_key(update_info) or "新节点"
+        cleaned_entries = [(key, value) for key, value in entries if key or value]
+        if not cleaned_entries:
+            fallback_key = self._infer_key(update_info) or "新节点"
+            fallback_content = response.strip() or update_info.strip()
+            return [(fallback_key, fallback_content)]
 
-        return key, content
+        normalized: list[tuple[str, str]] = []
+        for idx, (key, value) in enumerate(cleaned_entries, start=1):
+            if not key:
+                key = self._infer_key(update_info) or f"新节点{idx}"
+            normalized.append((key, value))
+
+        if not normalized[-1][1]:
+            fallback = response.strip() or update_info.strip() or "无"
+            normalized[-1] = (normalized[-1][0], fallback)
+
+        return normalized
 
     def _infer_key(self, update_info: str) -> str:
         match = re.search(
@@ -450,6 +736,35 @@ class WorldAgent:
             candidate = f"{base}{counter}"
             counter += 1
         return candidate
+
+    def _is_micro_branch(self, node: WorldNode) -> bool:
+        current = node
+        while current:
+            if current.identifier == "micro":
+                return True
+            current = current.parent
+        return False
+
+    def _is_macro_branch(self, node: WorldNode) -> bool:
+        current = node
+        while current:
+            if current.identifier == "macro":
+                return True
+            current = current.parent
+        return False
+
+    def _is_micro_region(self, node: WorldNode) -> bool:
+        return bool(node.identifier != "micro" and node.parent and node.parent.identifier == "micro")
+
+    def _maybe_seed_polity_aspects(self, polity: WorldNode, remaining_keys: list[str]) -> None:
+        aspect_names = {aspect_key for _, aspect_key in MICRO_POLITY_ASPECTS}
+        if any(key in aspect_names for key in remaining_keys):
+            return
+        for aspect_id, aspect_key in MICRO_POLITY_ASPECTS:
+            child_id = f"{polity.identifier}.{aspect_id}"
+            if child_id in self.engine.nodes:
+                continue
+            self.engine.add_child(polity.identifier, aspect_id, aspect_key)
 
     def _system_prompt(self) -> str:
         return (
