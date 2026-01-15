@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from llm_api.llm_client import LLMClient
 from world.world_agent import ADD_TAG, WorldAgent

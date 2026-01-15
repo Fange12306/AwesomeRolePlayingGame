@@ -165,6 +165,14 @@ class GameAgent:
             lines.append("现有角色：")
             for record in self.character_agent.engine.records:
                 lines.append(self._summarize_character(record))
+        if self.world_agent and self.world_agent.engine.nodes:
+            lines.append("现有世界节点：")
+            nodes = sorted(
+                self.world_agent.engine.nodes.values(),
+                key=lambda item: item.identifier,
+            )
+            for node in nodes:
+                lines.append(self._summarize_world_node(node))
         return "\n".join(lines)
 
     # Helpers -------------------------------------------------------------
@@ -179,6 +187,12 @@ class GameAgent:
             parts.append(name)
         label = f"简述:{summary}" if summary else ""
         return f"- {' '.join(parts)} {label}".strip()
+
+    def _summarize_world_node(self, node: WorldNode) -> str:
+        value = (node.value or "").strip()
+        summary = _truncate_text(value, limit=240) if value else ""
+        label = f": {summary}" if summary else ""
+        return f"- {node.identifier} {node.key}{label}".strip()
 
     def _parse_decision(self, response: str, update_info: str) -> tuple[bool, bool, str]:
         for match in re.finditer(r"\{.*?\}", response, flags=re.DOTALL):

@@ -135,8 +135,11 @@ class WorldEngine:
         parent_identifier: str,
         child_key: str,
         key: str,
+        allow_macro_add: bool = False,
     ) -> WorldNode:
         parent = self._require_node(parent_identifier)
+        if not allow_macro_add and self._is_macro_branch(parent):
+            raise ValueError(f"Cannot add child under macro tree: {parent_identifier}")
         if parent_identifier in {"world", "macro"}:
             child_identifier = child_key
         else:
@@ -154,12 +157,15 @@ class WorldEngine:
         identifier: str,
         key: str,
         parent_identifier: Optional[str] = None,
+        allow_macro_add: bool = False,
     ) -> WorldNode:
         if identifier in self.nodes:
             raise ValueError(f"Node {identifier} already exists")
 
         parent_id = parent_identifier or self._infer_parent_id(identifier)
         parent_node = self._ensure_node(parent_id)
+        if not allow_macro_add and self._is_macro_branch(parent_node):
+            raise ValueError(f"Cannot add node under macro tree: {parent_id}")
         new_node = WorldNode(identifier=identifier, key=key)
         parent_node.add_child(new_node)
         self.nodes[identifier] = new_node
@@ -329,7 +335,7 @@ class WorldEngine:
                     node.key = key
                     node.value = value
                 else:
-                    node = self.add_node(identifier, key)
+                    node = self.add_node(identifier, key, allow_macro_add=True)
                     node.value = value
             self.logger.info("apply_snapshot nodes=%s", len(snapshot))
         except Exception:
@@ -772,6 +778,14 @@ class WorldEngine:
         parent_node.add_child(placeholder)
         self.nodes[identifier] = placeholder
         return placeholder
+
+    def _is_macro_branch(self, node: WorldNode) -> bool:
+        current = node
+        while current:
+            if current.identifier == "macro":
+                return True
+            current = current.parent
+        return False
 
     def _iter_nodes(self, skip_root: bool = False) -> Iterable[WorldNode]:
         ordered: List[WorldNode] = []

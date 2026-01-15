@@ -147,6 +147,9 @@ class WorldAgent:
     def collect_actions(
         self, update_info: str, max_actions: Optional[int] = None
     ) -> list[ActionDecision]:
+        special_actions = self._collect_polity_actions(update_info, max_actions=max_actions)
+        if special_actions:
+            return special_actions
         candidate_indices = self._extract_candidate_indices(update_info)
         candidate_count = len({item for item in candidate_indices if item})
         llm_limit = max_actions
@@ -363,6 +366,16 @@ class WorldAgent:
 
     def _apply_add(self, index: str, update_info: str) -> WorldNode:
         parent = self.engine.view_node(index)
+        special = self._parse_add_polity_command(update_info)
+        if special:
+            region_name, polity_name = special
+            if parent.identifier == "micro":
+                region = self._find_micro_region(region_name)
+                if region:
+                    return self._add_micro_polity(region, polity_name)
+                return self._add_micro_region(region_name)
+            if self._is_micro_region(parent) and self._matches_region(parent, region_name):
+                return self._add_micro_polity(parent, polity_name)
         prompt = self._build_add_prompt(parent, update_info)
         response = self._chat_once(
             prompt, system_prompt=self._system_prompt(), log_label="ADD_NODE"
@@ -548,6 +561,158 @@ class WorldAgent:
             if key in text:
                 candidates.append(node.identifier)
         return candidates
+
+    def _collect_polity_actions(
+        self, update_info: str, max_actions: Optional[int] = None
+    ) -> Optional[list[ActionDecision]]:
+        parsed = self._parse_add_polity_command(update_info)
+        if not parsed:
+            return None
+        region_name, polity_name = parsed
+        if "micro" not in self.engine.nodes:
+            return None
+        region = self._find_micro_region(region_name)
+        if region:
+            actions = [
+                ActionDecision(
+                    flag=ADD_TAG, index=region.identifier, raw="special:add_polity"
+                )
+            ]
+        else:
+            micro = self.engine.view_node("micro")
+            region_key = self._choose_region_key(micro)
+            region_id = f"micro.{region_key}"
+            actions = [
+                ActionDecision(flag=ADD_TAG, index="micro", raw="special:add_region"),
+                ActionDecision(flag=ADD_TAG, index=region_id, raw="special:add_polity"),
+            ]
+        if max_actions is not None and len(actions) > max_actions:
+            self.logger.info(
+                "collect_polity_actions override max_actions=%s actions=%s region=%s polity=%s",
+                max_actions,
+                len(actions),
+                region_name,
+                polity_name,
+            )
+        else:
+            self.logger.info(
+                "collect_polity_actions actions=%s region=%s polity=%s",
+                len(actions),
+                region_name,
+                polity_name,
+            )
+        return actions
+
+    def _parse_add_polity_command(
+        self, update_info: str
+    ) -> Optional[tuple[str, str]]:
+        text = update_info.strip()
+        if not text:
+            return None
+        patterns = [
+            r"在\s*[「\"“'](?P<region>[^」\"”']+)[」\"”']\s*(?:地区)?\s*新增\s*[「\"“'](?P<polity>[^」\"”']+)[」\"”']\s*(?:国家|政权)?",
+            r"在\s*(?P<region>[^\s，,。\"“”'「」]+)\s*(?:地区)?\s*新增\s*(?P<polity>[^\s，,。\"“”'「」]+)\s*(?:国家|政权)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            region = match.group("region").strip()
+            polity = match.group("polity").strip()
+            if region and polity:
+                return region, polity
+        return None
+
+    def _find_micro_region(self, region_identifier: str) -> Optional[WorldNode]:
+        name = region_identifier.strip()
+        if not name:
+            return None
+        try:
+            region_id = self._resolve_region_id(name)
+            region = self.engine.view_node(region_id)
+            self._require_micro_region(region)
+            return region
+        except Exception:
+            return None
+
+    def _matches_region(self, region: WorldNode, region_name: str) -> bool:
+        cleaned = region_name.strip()
+        if not cleaned:
+            return False
+        cleaned_lower = cleaned.lower()
+        return (
+            cleaned_lower == region.identifier.lower()
+            or cleaned_lower == region.key.strip().lower()
+        )
+
+    def _find_child_by_key(self, parent: WorldNode, key: str) -> Optional[WorldNode]:
+        target = key.strip()
+        if not target:
+            return None
+        target_lower = target.lower()
+        for child in parent.children.values():
+            child_key = child.key.strip()
+            if not child_key:
+                continue
+            if child_key == target or child_key.lower() == target_lower:
+                return child
+        return None
+
+    def _choose_region_key(self, micro_root: WorldNode) -> str:
+        existing = {child.identifier.split(".")[-1] for child in micro_root.children.values()}
+        return self._increment_key("r1", existing)
+
+    def _add_micro_region(self, region_name: str) -> WorldNode:
+        name = region_name.strip()
+        if not name:
+            raise ValueError("region_name is required")
+        micro = self.engine.view_node("micro")
+        existing = self._find_child_by_key(micro, name)
+        if existing:
+            return existing
+        region_key = self._choose_region_key(micro)
+        region = self.engine.add_child(micro.identifier, region_key, name)
+        self._maybe_generate_micro_value(region, log_label="MICRO_VALUE_ADD_REGION")
+        return region
+
+    def _add_micro_polity(self, region: WorldNode, polity_name: str) -> WorldNode:
+        name = polity_name.strip()
+        if not name:
+            raise ValueError("polity_name is required")
+        self._require_micro_region(region)
+        existing = self._find_child_by_key(region, name)
+        if existing:
+            return existing
+        polity_key = self._choose_polity_key(region)
+        polity = self.engine.add_child(region.identifier, polity_key, name)
+        for aspect_id, aspect_key in MICRO_POLITY_ASPECTS:
+            self.engine.add_child(polity.identifier, aspect_id, aspect_key)
+        self._maybe_generate_micro_value(polity, log_label="MICRO_VALUE_ADD_POLITY")
+        for aspect in self.engine.view_children(polity.identifier):
+            self._maybe_generate_micro_value(
+                aspect, log_label=f"MICRO_VALUE_ADD_{aspect.identifier}"
+            )
+        return polity
+
+    def _maybe_generate_micro_value(self, node: WorldNode, log_label: str) -> None:
+        if node.value.strip():
+            return
+        try:
+            prompt = self.engine._build_micro_value_prompt(node)
+            response = self._chat_once(
+                prompt,
+                system_prompt=WorldPromptBuilder.system_prompt(),
+                log_label=log_label,
+            )
+        except Exception:
+            self.logger.exception(
+                "generate_micro_value failed id=%s key=%s", node.identifier, node.key
+            )
+            return
+        content = response.strip()
+        if not content or content.startswith("Error in chat_"):
+            return
+        node.value = content
 
     def _require_micro_region(self, region: WorldNode) -> None:
         if region.identifier == "micro":

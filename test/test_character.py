@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from pathlib import Path
+
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from character.character_engine import CharacterEngine, CharacterRequest
 

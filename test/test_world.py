@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
+
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from world.world_engine import WorldEngine
 
@@ -111,17 +115,26 @@ def _run_node_tests(engine: WorldEngine) -> None:
     updated_node = engine.view_node(sample_id)
     print(f"编辑节点内容: {updated_node.identifier} - {updated_node.value}")
 
-    new_key = "4"
-    new_identifier = f"2.{new_key}"
-    if new_identifier in engine.nodes:
-        new_key = "5"
-        new_identifier = f"2.{new_key}"
-    new_node = engine.add_child("2", new_key, "未来冲突")
-    print(f"新增节点: {new_node.identifier} - {new_node.key}")
+    if "micro" in engine.nodes:
+        children = engine.view_children("micro")
+        keys = []
+        for child in children:
+            parts = child.identifier.split(".")
+            if parts and parts[-1].startswith("r"):
+                keys.append(parts[-1])
+        next_index = 1
+        for key in keys:
+            if key[1:].isdigit():
+                next_index = max(next_index, int(key[1:]) + 1)
+        new_key = f"r{next_index}"
+        new_node = engine.add_child("micro", new_key, "新地区")
+        print(f"新增节点: {new_node.identifier} - {new_node.key}")
 
-    children = engine.view_children("2")
-    child_ids = [child.identifier for child in children]
-    print(f"查看子节点(2): {child_ids}")
+        children = engine.view_children("micro")
+        child_ids = [child.identifier for child in children]
+        print(f"查看子节点(micro): {child_ids}")
+    else:
+        print("micro 根节点不存在，跳过新增节点测试。")
 
 
 def _choose_sample_node(engine: WorldEngine) -> str:

@@ -10,7 +10,7 @@ World graph utilities backed by `world/world_engine.py` and `world/world_prompt.
 ## 主要 API（WorldEngine）
 - `view_node(identifier)`：查看节点信息。
 - `view_children(identifier)`：列出子节点。
-- `add_child(parent_id, child_key, key)`：在父节点下添加子节点（节点 ID 自动拼接）。
+- `add_child(parent_id, child_key, key)`：在父节点下添加子节点（节点 ID 自动拼接）。宏观(Macro)树不允许新增节点。
 - `add_node(identifier, key, parent_identifier=None)`：按完整 ID 添加节点。
 - `update_node_content(identifier, value)`：更新节点内容。
 - `generate_world(user_pitch, regenerate=False)`：先生成 macro 节点内容，再生成 micro 结构与缺失内容。

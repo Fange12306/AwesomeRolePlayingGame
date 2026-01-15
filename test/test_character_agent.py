@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from character.character_agent import ADD_TAG, CharacterAgent
 from character.character_engine import CharacterEngine, CharacterRecord
