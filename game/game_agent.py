@@ -14,7 +14,7 @@ from character.character_agent import (
 )
 from character.character_engine import CharacterRecord
 from llm_api.llm_client import LLMClient
-from world.world_agent import ActionDecision, WorldAgent
+from world.world_agent import ActionDecision, WorldAgent, UPDATE_TAG as WORLD_UPDATE_TAG
 from world.world_engine import WorldNode
 
 DEFAULT_LOG_PATH = Path("log") / "game_agent.log"
@@ -23,6 +23,7 @@ DEFAULT_SEARCH_ROUNDS = 2
 DEFAULT_SEARCH_LIMIT = 4
 DEFAULT_SEARCH_CONTEXT_LIMIT = 320
 DEFAULT_COMMAND_VALIDATE_ROUNDS = 2
+DEFAULT_POLITY_MERGE_KEYWORDS = ("合并", "并入", "吞并", "并吞", "并为", "归并")
 
 
 def _truncate_text(text: str, limit: int = 800) -> str:
@@ -140,6 +141,9 @@ class GameAgent:
             raise
 
     def apply_update(self, update_info: str) -> GameUpdateResult:
+        merge_result = self._apply_polity_merge(update_info)
+        if merge_result:
+            return merge_result
         search_state = self._run_search_and_read(update_info)
         read_context = self._build_read_context_lines(
             search_state.world, search_state.characters, DEFAULT_SEARCH_CONTEXT_LIMIT
@@ -623,6 +627,283 @@ class GameAgent:
         if not joined:
             return ""
         return f"关联政权更新：{joined}"
+
+    def _apply_polity_merge(self, update_info: str) -> Optional[GameUpdateResult]:
+        if not self.world_agent or not self.character_agent:
+            return None
+        polities = self._list_micro_polities()
+        if len(polities) < 2:
+            return None
+        if not self._is_polity_merge_candidate(update_info, polities):
+            return None
+        prompt = self._build_polity_merge_prompt(update_info, polities)
+        response = self._chat_once(
+            prompt,
+            system_prompt=self._system_prompt(),
+            log_label="GAME_POLITY_MERGE",
+        )
+        keep_raw, remove_raw = self._parse_polity_merge_response(response)
+        if not keep_raw or not remove_raw:
+            return None
+        polity_lookup = {node.identifier: node for node in polities}
+        keep_id = self._resolve_polity_identifier(keep_raw, polity_lookup)
+        remove_id = self._resolve_polity_identifier(remove_raw, polity_lookup)
+        if not keep_id or not remove_id or keep_id == remove_id:
+            return None
+        keep_node = self.world_agent.engine.nodes.get(keep_id)
+        remove_node = self.world_agent.engine.nodes.get(remove_id)
+        if not keep_node or not remove_node:
+            return None
+
+        update_payload = self._build_polity_merge_update_payload(
+            update_info, keep_node, remove_node
+        )
+        updated_node = self.world_agent.apply_update(
+            WORLD_UPDATE_TAG, keep_id, update_payload
+        )
+        removed = self.world_agent.remove_polity(remove_id)
+
+        decision = GameUpdateDecision(
+            update_world=True,
+            update_characters=True,
+            raw=response,
+            reason="polity_merge",
+        )
+        result = GameUpdateResult(decision=decision)
+        result.world_decisions = [
+            ActionDecision(flag=WORLD_UPDATE_TAG, index=keep_id, raw=response)
+        ]
+        result.world_nodes = [updated_node]
+        result.world_decision = result.world_decisions[0]
+        result.world_node = updated_node
+
+        char_decisions, char_records = self._apply_polity_merge_character_updates(
+            update_info, keep_node, remove_node, keep_id, remove_id
+        )
+        result.character_decisions = char_decisions
+        result.character_records = char_records
+        result.character_decision = char_decisions[0] if char_decisions else None
+        result.character_record = char_records[0] if char_records else None
+
+        self.logger.info(
+            "polity_merge keep=%s remove=%s removed=%s characters=%s",
+            keep_id,
+            remove_id,
+            len(removed),
+            len(char_records),
+        )
+        return result
+
+    def _apply_polity_merge_character_updates(
+        self,
+        update_info: str,
+        keep_node: WorldNode,
+        remove_node: WorldNode,
+        keep_id: str,
+        remove_id: str,
+    ) -> tuple[list[CharacterActionDecision], list[CharacterRecord]]:
+        if not self.character_agent:
+            return [], []
+        impacted: list[tuple[CharacterRecord, Optional[str]]] = []
+        for record in self.character_agent.engine.records:
+            if record.polity_id in {keep_id, remove_id}:
+                impacted.append((record, record.polity_id))
+        if not impacted:
+            return [], []
+
+        keep_region_id = keep_node.parent.identifier if keep_node.parent else None
+        merge_context = self._build_polity_merge_context(keep_node, remove_node)
+        decisions: list[CharacterActionDecision] = []
+        records: list[CharacterRecord] = []
+        for record, original_polity_id in impacted:
+            if original_polity_id == remove_id:
+                record.polity_id = keep_id
+                if keep_region_id:
+                    record.region_id = keep_region_id
+            update_payload = self._build_polity_merge_character_payload(
+                update_info,
+                merge_context,
+                keep_node,
+                remove_node,
+                original_polity_id or "",
+            )
+            decision = CharacterActionDecision(
+                flag=CHARACTER_UPDATE_TAG,
+                identifier=record.identifier,
+                raw="polity_merge",
+            )
+            updated = self.character_agent.apply_update(
+                decision.flag, decision.identifier, update_payload
+            )
+            decisions.append(decision)
+            records.append(updated)
+        return decisions, records
+
+    def _list_micro_polities(self) -> list[WorldNode]:
+        if not self.world_agent:
+            return []
+        polities = [
+            node
+            for node in self.world_agent.engine.nodes.values()
+            if self._is_micro_polity(node)
+        ]
+        return sorted(polities, key=lambda item: item.identifier)
+
+    def _is_polity_merge_candidate(
+        self, update_info: str, polities: list[WorldNode]
+    ) -> bool:
+        text = update_info.strip()
+        if not text:
+            return False
+        if not any(keyword in text for keyword in DEFAULT_POLITY_MERGE_KEYWORDS):
+            return False
+        mentioned: set[str] = set()
+        for node in polities:
+            key = node.key.strip()
+            if node.identifier and node.identifier in text:
+                mentioned.add(node.identifier)
+            if key and key in text:
+                mentioned.add(node.identifier)
+            if len(mentioned) >= 2:
+                return True
+        return False
+
+    def _build_polity_merge_prompt(
+        self, update_info: str, polities: list[WorldNode]
+    ) -> str:
+        lines = [
+            "【任务】判断是否为政权合并，并给出保留与删除的政权ID。",
+            "仅从可用政权列表中选择。",
+            "如果不是政权合并或无法判断，请输出 NONE。",
+            "输出必须包含两处冗余，且只输出两行：",
+            "1) MERGE=KEEP_ID; REMOVE_ID 或 MERGE=NONE",
+            '2) {"keep":"ID","remove":"ID","reason":"..."} 或 {"merge":false,"reason":"..."}',
+            f"剧情信息：{update_info.strip()}",
+            "可用政权：",
+        ]
+        for node in polities:
+            region_label = ""
+            if node.parent:
+                region_label = node.parent.key.strip()
+            label = f"{node.identifier} {node.key}"
+            if region_label:
+                label = f"{label} (region: {region_label})"
+            lines.append(f"- {label}")
+        return "\n".join(lines)
+
+    def _parse_polity_merge_response(self, response: str) -> tuple[str, str]:
+        for match in re.finditer(r"\{.*?\}", response, flags=re.DOTALL):
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if "merge" in data:
+                merge_flag = self._coerce_bool(data.get("merge"))
+                if merge_flag is False:
+                    return "", ""
+            keep = data.get("keep") or data.get("keep_id") or data.get("target")
+            remove = data.get("remove") or data.get("remove_id") or data.get("source")
+            keep_text = str(keep or "").strip()
+            remove_text = str(remove or "").strip()
+            if keep_text.upper() in {"NONE", "NO", "无"}:
+                keep_text = ""
+            if remove_text.upper() in {"NONE", "NO", "无"}:
+                remove_text = ""
+            if keep_text or remove_text:
+                return keep_text, remove_text
+
+        merge_match = re.search(r"MERGE\s*[:=]\s*([^\n]+)", response, re.IGNORECASE)
+        if merge_match:
+            raw = merge_match.group(1).strip()
+            if raw.upper() in {"NONE", "NO", "无"}:
+                return "", ""
+            parts = re.split(r"[;,，]+", raw)
+            if len(parts) >= 2:
+                return parts[0].strip(), parts[1].strip()
+        return "", ""
+
+    def _resolve_polity_identifier(
+        self, token: str, polity_lookup: dict[str, WorldNode]
+    ) -> Optional[str]:
+        cleaned = token.strip()
+        if not cleaned:
+            return None
+        if cleaned in polity_lookup:
+            return cleaned
+        if "/" in cleaned:
+            head = cleaned.split("/", 1)[0].strip()
+            if head in polity_lookup:
+                return head
+        cleaned = cleaned.strip("()（）")
+        matches = [
+            identifier
+            for identifier, node in polity_lookup.items()
+            if node.key.strip() == cleaned
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        for identifier, node in polity_lookup.items():
+            if identifier and identifier in cleaned:
+                return identifier
+        key_matches = [
+            identifier
+            for identifier, node in polity_lookup.items()
+            if node.key.strip() and node.key.strip() in cleaned
+        ]
+        if len(key_matches) == 1:
+            return key_matches[0]
+        return None
+
+    def _build_polity_merge_context(
+        self, keep_node: WorldNode, remove_node: WorldNode
+    ) -> str:
+        merge_line = (
+            f"政权合并: {remove_node.identifier} {remove_node.key} 并入 "
+            f"{keep_node.identifier} {keep_node.key}"
+        )
+        details = self._build_polity_update_context(
+            [keep_node, remove_node],
+            limit=DEFAULT_SEARCH_CONTEXT_LIMIT,
+        )
+        if details:
+            return f"{merge_line}\n{details}"
+        return merge_line
+
+    def _build_polity_merge_update_payload(
+        self, update_info: str, keep_node: WorldNode, remove_node: WorldNode
+    ) -> str:
+        context = self._build_polity_merge_context(keep_node, remove_node)
+        return (
+            f"{update_info.strip()}\n{context}\n"
+            "请根据合并结果更新保留政权的描述。"
+        )
+
+    def _build_polity_merge_character_payload(
+        self,
+        update_info: str,
+        merge_context: str,
+        keep_node: WorldNode,
+        remove_node: WorldNode,
+        original_polity_id: str,
+    ) -> str:
+        lines = [
+            update_info.strip(),
+            merge_context,
+            "请更新角色档案以反映政权合并影响。",
+        ]
+        if original_polity_id == remove_node.identifier:
+            lines.append(
+                f"角色原属政权: {remove_node.identifier} {remove_node.key}；"
+                f"现归属: {keep_node.identifier} {keep_node.key}"
+            )
+        else:
+            lines.append(
+                f"角色所属政权: {keep_node.identifier} {keep_node.key} 吸收 "
+                f"{remove_node.identifier} {remove_node.key}"
+            )
+        return "\n".join(line for line in lines if line)
 
     def _is_micro_polity(self, node: WorldNode) -> bool:
         return bool(node.parent and node.parent.parent and node.parent.parent.identifier == "micro")

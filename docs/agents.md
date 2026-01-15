@@ -19,6 +19,7 @@
   - `update_world = True`：调用 `WorldAgent.collect_actions/decide_actions` 与 `apply_updates`。
   - `update_characters = True`：调用 `CharacterAgent.collect_actions/decide_actions` 与 `apply_updates`。
   - 若世界更新触及微观政权节点，会额外判断该政权下绑定角色是否需要更新。
+  - 若剧情明确涉及“政权合并”，会先更新保留政权、删除被并入政权，并更新两者相关的角色档案与归属信息。
 
 ## WorldAgent
 - 输入：剧情文本 `update_info` 或查询 `query`。
