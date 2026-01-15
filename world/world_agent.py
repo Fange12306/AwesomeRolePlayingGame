@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 from llm_api.llm_client import LLMClient
 from world.world_engine import WorldEngine, WorldNode
-from world.world_prompt import MICRO_POLITY_ASPECTS
+from world.world_prompt import MICRO_POLITY_ASPECTS, WorldPromptBuilder
 
 ADD_TAG = "<|ADD_NODE|>"
 UPDATE_TAG = "<|UPDATE_NODE|>"
@@ -231,6 +231,7 @@ class WorldAgent:
             polity = self.engine.add_child(region.identifier, polity_key, name)
             for aspect_id, aspect_key in MICRO_POLITY_ASPECTS:
                 self.engine.add_child(polity.identifier, aspect_id, aspect_key)
+            self._fill_micro_polity_values(polity, log_label_prefix="MICRO_VALUE_ADD")
             self.logger.info(
                 "add_polity region=%s polity=%s id=%s",
                 region.identifier,
@@ -385,6 +386,7 @@ class WorldAgent:
             pairs = pairs[:1]
         current_parent = parent
         last_node: Optional[WorldNode] = None
+        new_polities: list[WorldNode] = []
         for idx, (key, content) in enumerate(pairs):
             child_key = self._choose_child_key(current_parent)
             node = self.engine.add_child(current_parent.identifier, child_key, key)
@@ -393,8 +395,12 @@ class WorldAgent:
             if self._is_micro_region(current_parent):
                 remaining_keys = [item[0] for item in pairs[idx + 1 :]]
                 self._maybe_seed_polity_aspects(node, remaining_keys)
+            if self._is_micro_polity(node):
+                new_polities.append(node)
             last_node = node
             current_parent = node
+        for polity in new_polities:
+            self._fill_micro_polity_values(polity, log_label_prefix="MICRO_VALUE_ADD")
         if not last_node:
             raise ValueError("No node created for add action")
         return last_node
@@ -687,12 +693,21 @@ class WorldAgent:
         polity = self.engine.add_child(region.identifier, polity_key, name)
         for aspect_id, aspect_key in MICRO_POLITY_ASPECTS:
             self.engine.add_child(polity.identifier, aspect_id, aspect_key)
-        self._maybe_generate_micro_value(polity, log_label="MICRO_VALUE_ADD_POLITY")
+        self._fill_micro_polity_values(polity, log_label_prefix="MICRO_VALUE_ADD")
+        return polity
+
+    def _fill_micro_polity_values(
+        self, polity: WorldNode, log_label_prefix: str
+    ) -> None:
+        if not self._is_micro_polity(polity):
+            return
+        self._maybe_generate_micro_value(
+            polity, log_label=f"{log_label_prefix}_POLITY"
+        )
         for aspect in self.engine.view_children(polity.identifier):
             self._maybe_generate_micro_value(
-                aspect, log_label=f"MICRO_VALUE_ADD_{aspect.identifier}"
+                aspect, log_label=f"{log_label_prefix}_{aspect.identifier}"
             )
-        return polity
 
     def _maybe_generate_micro_value(self, node: WorldNode, log_label: str) -> None:
         if node.value.strip():
