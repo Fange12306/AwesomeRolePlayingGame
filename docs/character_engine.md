@@ -1,54 +1,56 @@
-# Character Engine
+# Character Engine（详细版）
 
 角色生成与关系构建工具，核心实现位于 `character/character_engine.py` 与 `character/character_prompt.py`。
 
-## 核心设计
-- 数据来源：读取世界快照（`WorldEngine.as_dict()` 或 `save/world/*.json`），抽取 `micro` 子树作为挂载点。
-- 角色结果：每条记录为 `id/region_id/polity_id/profile`，`profile` 尽量解析为 JSON；解析失败时会保留原始文本。
-- 关系拆分：角色关系与角色-地点关系采用独立边表（`relations` / `character_location_edges`）。
-- 日志记录：LLM 调用日志写入 `log/llm.log`，并带 `TYPE` 标记。
+## 数据结构
+- `CharacterRequest`：生成请求（`total`, `pitch`）。
+- `MountPoint`：角色挂载点（地区/政权 ID + key/value 摘要）。
+- `CharacterBlueprint`：生成蓝图（角色 ID + 挂载点 ID）。
+- `CharacterRecord`：角色记录（`identifier`, `region_id`, `polity_id`, `profile`）。
 
-## 主要 API（CharacterEngine）
-- `from_world_snapshot(path, llm_client=None)`：从世界快照文件初始化。
-- `set_world_snapshot(snapshot_dict)`：注入世界快照字典。
-- `extract_mount_points()`：解析 `micro` 下的区域/政体挂载点。
-- `build_blueprints(request)`：构建角色蓝图（ID + 挂载点，按挂载点轮询分配）。
-- `generate_characters(request, regenerate=False)`：生成角色列表。
-- `generate_relations(records=None)`：基于角色列表生成角色关系边表。
-- `generate_location_edges(records=None, regenerate=False)`：生成角色-地点边表（规则边 + LLM 补充边）。
-- `save_snapshot(path, records=None)`：保存角色快照 JSON。
+## 世界快照依赖
+- `CharacterEngine` 读取世界快照（`save/world/*.json` 或传入字典）。
+- 仅依赖 `micro` 子树以提取地区/政权挂载点。
+- world snapshot 缺失时仍可生成角色，但挂载点为空。
 
-## LLM 生成流程
-1) 读取世界快照并提取 `micro` 区域/政体节点。  
-2) 使用角色总概况（可选）生成角色（`CharacterPromptBuilder`），输出 JSON `profile`。  
-3) 基于角色摘要生成关系边表（`RelationPromptBuilder`）。  
-4) 生成地点边表：先添加规则边（`origin`/`affiliation`），再由 LLM 补充额外关系（`LocationRelationPromptBuilder`）。  
-5) 保存快照，包含 `characters/relations/character_location_edges`。  
+## 角色生成流程
+1) **挂载点提取**
+   - `extract_mount_points()` 遍历 `micro` 根下的地区与政权。
+   - 若地区没有政权，则仅生成地区挂载点。
+2) **蓝图分配**
+   - `build_blueprints()` 按挂载点循环分配角色位置（round-robin）。
+3) **角色档案生成**
+   - `CharacterPromptBuilder.build_prompt()` 构造角色 prompt。
+   - 输出必须为单个 JSON 对象，包含固定字段：
+     `name, summary, background, motivation, conflict, abilities, weaknesses, relationships, hooks, faction, profession, species, tier`。
+   - `_generate_profile_with_retry` 会对非 JSON 输出进行一次重试。
+4) **保存结果**
+   - `save_snapshot()` 写入角色快照 JSON（含关系边表）。
 
-### 提示词生成（Prompt Builder）
-- `CharacterPromptBuilder`：生成角色设定 JSON（含 `faction/profession/species/tier` 等字段）。
-- `RelationPromptBuilder`：生成角色关系边表（有向边）。
-- `LocationRelationPromptBuilder`：生成角色-地点关系边表（角色 -> 地点）。
+## 角色关系边表
+- `generate_relations()` 使用 `RelationPromptBuilder`，输出 JSON 数组。
+- 字段约束：
+  - `source_id`, `target_id`, `type`, `stance`, `intensity`, `note`。
+- 解析失败时回退为 `[{"raw": "..."}]` 结构。
 
-## 使用示例
-```python
-from character.character_engine import CharacterEngine, CharacterRequest
+## 角色-地点关系边表
+- `generate_location_edges()` 由两部分组成：
+  1) **规则边**：
+     - `origin`：角色 -> region
+     - `affiliation`：角色 -> polity
+  2) **LLM 补充边**：每个角色额外 1-2 条地点关系。
+- 地点类型推断：
+  - `micro.rX` -> `region`
+  - `micro.rX.pY` -> `polity`
+  - 其他 `micro.*` 子节点 -> `subregion`
+  - 固定政权子节点（文化/经济/政治/人口/地理/技术/资源）会被排除。
+- 合并策略：去重、仅保留有效角色/地点 ID。
 
-engine = CharacterEngine.from_world_snapshot("save/world/world_20240101_120000.json")
-request = CharacterRequest(total=6, pitch="一句话角色总概况")
-
-records = engine.generate_characters(request)
-relations = engine.generate_relations(records)
-location_edges = engine.generate_location_edges(records)
-
-engine.save_snapshot("save/characters/characters_20240101_120000.json")
-```
-
-## 输出结构（角色快照）
+## 角色快照格式
 ```json
 {
-  "generated_at": "...",
-  "world_snapshot_path": "...",
+  "generated_at": "2024-01-01T12:00:00",
+  "world_snapshot_path": "save/world/world_20240101_120000.json",
   "characters": [
     {
       "id": "c1",
@@ -76,6 +78,31 @@ engine.save_snapshot("save/characters/characters_20240101_120000.json")
 }
 ```
 
-## 环境配置
-- 依赖 `.env` 或系统变量：`OPENAI_API_KEY`（必需）、`OPENAI_BASE_URL`（可选）、`OPENAI_MODEL`（可选，默认 `gpt-3.5-turbo`）。
-- `test/test_character.py` 提供交互式流程：选择世界快照、输入角色数量与角色总概况。
+## 主要 API
+- `from_world_snapshot(path, llm_client=None)`：从世界快照文件初始化。
+- `set_world_snapshot(snapshot_dict)`：注入世界快照字典。
+- `extract_mount_points()`：解析 `micro` 下的地区/政权挂载点。
+- `build_blueprints(request)`：构建角色蓝图。
+- `generate_characters(request, regenerate=False)`：生成角色列表。
+- `generate_relations(records=None)`：生成角色关系边表。
+- `generate_location_edges(records=None, regenerate=False)`：生成角色-地点边表。
+- `save_snapshot(path, records=None)`：保存角色快照 JSON。
+
+## 使用示例
+```python
+from character.character_engine import CharacterEngine, CharacterRequest
+
+engine = CharacterEngine.from_world_snapshot("save/world/world_20240101_120000.json")
+request = CharacterRequest(total=6, pitch="一句话角色总概况")
+
+records = engine.generate_characters(request)
+relations = engine.generate_relations(records)
+location_edges = engine.generate_location_edges(records)
+
+engine.save_snapshot("save/characters/characters_20240101_120000.json")
+```
+
+## 日志与提示词
+- LLM 调用日志：`log/llm.log`。
+- 角色模块日志：`log/character_engine.log`。
+- 提示词模板：`character/character_prompt.py`。
