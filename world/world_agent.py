@@ -13,6 +13,7 @@ from world.world_prompt import MICRO_POLITY_ASPECTS, WorldPromptBuilder
 
 ADD_TAG = "<|ADD_NODE|>"
 UPDATE_TAG = "<|UPDATE_NODE|>"
+REMOVE_TAG = "<|REMOVE_NODE|>"
 DEFAULT_LOG_PATH = Path("log") / "world_agent.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(message)s"
 DEFAULT_MAX_ACTIONS = 3
@@ -200,6 +201,14 @@ class WorldAgent:
                 node = self._apply_update(index, update_info)
                 self.logger.info("apply_update update index=%s", index)
                 return node
+            if normalized == REMOVE_TAG:
+                node = self.engine.view_node(index)
+                if self._is_micro_polity(node):
+                    self.remove_polity(node.identifier)
+                else:
+                    self.engine.remove_node(node.identifier)
+                self.logger.info("apply_update remove index=%s", index)
+                return node
             raise ValueError(f"Unknown flag: {flag}")
         except Exception:
             self.logger.exception(
@@ -299,18 +308,39 @@ class WorldAgent:
     ) -> str:
         lines = [
             "【任务】判断更新操作",
-            "你需要决定是新增节点还是修改节点。",
+            "你需要决定是新增节点、修改节点或删除节点。",
+            "优先选择 micro 节点：当剧情涉及地区/国家/政权/城市/势力等具体实体时，选择 micro.* 下对应节点。",
+            "仅当剧情涉及世界底层法则、文明阶段、宏观主题或历史进程时才选择 macro 节点。",
             "宏观设定(Macro树)禁止新增节点，只能修改节点内容。",
             f"如果涉及多个节点，最多输出 {max_actions} 条操作。",
             "输出必须包含两处冗余，且只输出两行：",
-            f"1) {ADD_TAG}:INDEX 或 {UPDATE_TAG}:INDEX (多条用逗号分隔)",
-            '2) [{"action":"ADD_NODE"|"UPDATE_NODE","index":"INDEX"}, ...]',
-            "INDEX 必须是已有父节点的标识，ADD 时不要输出新节点 ID 或子路径。",
+            f"1) {ADD_TAG}:INDEX 或 {UPDATE_TAG}:INDEX 或 {REMOVE_TAG}:INDEX (多条用逗号分隔)",
+            '2) [{"action":"ADD_NODE"|"UPDATE_NODE"|"REMOVE_NODE","index":"INDEX"}, ...]',
+            "INDEX 必须是已有父节点或待删除节点的标识，ADD 时不要输出新节点 ID 或子路径。",
             f"剧情信息：{update_info.strip()}",
-            "可用节点：",
         ]
+        micro_nodes: list[WorldNode] = []
+        macro_nodes: list[WorldNode] = []
+        other_nodes: list[WorldNode] = []
         for node in self._iter_nodes():
-            lines.append(f"- {node.identifier} {node.key}")
+            if self._is_micro_branch(node):
+                micro_nodes.append(node)
+            elif self._is_macro_branch(node):
+                macro_nodes.append(node)
+            else:
+                other_nodes.append(node)
+        if micro_nodes:
+            lines.append("可用微观节点(优先选择 micro.*)：")
+            for node in micro_nodes:
+                lines.append(f"- {node.identifier} {node.key}")
+        if macro_nodes:
+            lines.append("可用宏观节点(仅宏观变更时选择)：")
+            for node in macro_nodes:
+                lines.append(f"- {node.identifier} {node.key}")
+        if other_nodes:
+            lines.append("可用其他节点：")
+            for node in other_nodes:
+                lines.append(f"- {node.identifier} {node.key}")
         return "\n".join(lines)
 
     def _build_update_prompt(self, node: WorldNode, update_info: str) -> str:
@@ -373,16 +403,6 @@ class WorldAgent:
 
     def _apply_add(self, index: str, update_info: str) -> WorldNode:
         parent = self.engine.view_node(index)
-        special = self._parse_add_polity_command(update_info)
-        if special:
-            region_name, polity_name = special
-            if parent.identifier == "micro":
-                region = self._find_micro_region(region_name)
-                if region:
-                    return self._add_micro_polity(region, polity_name)
-                return self._add_micro_region(region_name)
-            if self._is_micro_region(parent) and self._matches_region(parent, region_name):
-                return self._add_micro_polity(parent, polity_name)
         prompt = self._build_add_prompt(parent, update_info)
         response = self._chat_once(
             prompt, system_prompt=self._system_prompt(), log_label="ADD_NODE"
@@ -488,15 +508,28 @@ class WorldAgent:
 
     def _resolve_update_index(self, index: str, update_info: str) -> Optional[str]:
         candidate = self._clean_index(index)
+        prefer_micro = self._should_prefer_micro(update_info)
+        resolved: Optional[str] = None
         if candidate in self.engine.nodes:
-            return candidate
-        key_match = self._match_node_by_key(candidate)
-        if key_match:
-            return key_match
-        for identifier in self.engine.nodes:
-            if identifier and identifier in candidate:
-                return identifier
-        return self._match_node_in_text(update_info)
+            resolved = candidate
+        else:
+            key_match = self._match_node_by_key(candidate)
+            if key_match:
+                resolved = key_match
+            else:
+                for identifier in self.engine.nodes:
+                    if identifier and identifier in candidate:
+                        resolved = identifier
+                        break
+        if not resolved:
+            resolved = self._match_node_in_text(update_info)
+        if resolved and prefer_micro:
+            node = self.engine.nodes.get(resolved)
+            if node and self._is_macro_branch(node):
+                micro_target = self._resolve_micro_candidate(update_info)
+                if micro_target:
+                    return micro_target
+        return resolved
 
     def _match_node_by_key(self, key_text: str) -> Optional[str]:
         cleaned = key_text.strip()
@@ -509,6 +542,14 @@ class WorldAgent:
         ]
         if len(matches) == 1:
             return matches[0]
+        micro_matches = [
+            identifier
+            for identifier in matches
+            if identifier in self.engine.nodes
+            and self._is_micro_branch(self.engine.nodes[identifier])
+        ]
+        if len(micro_matches) == 1:
+            return micro_matches[0]
         return None
 
     def _match_node_in_text(self, text: str) -> Optional[str]:
@@ -530,6 +571,14 @@ class WorldAgent:
         ]
         if len(set(key_matches)) == 1:
             return key_matches[0]
+        micro_matches = [
+            identifier
+            for identifier in set(key_matches)
+            if identifier in self.engine.nodes
+            and self._is_micro_branch(self.engine.nodes[identifier])
+        ]
+        if len(micro_matches) == 1:
+            return micro_matches[0]
         return None
 
     def _is_micro_aspect_index(self, identifier: str) -> bool:
@@ -555,13 +604,91 @@ class WorldAgent:
             seen.add(resolved)
         return actions
 
+    def _should_prefer_micro(self, update_info: str) -> bool:
+        text = update_info.strip()
+        if not text:
+            return False
+        if "micro." in text:
+            return True
+        skip_keys = {aspect_key for _, aspect_key in MICRO_POLITY_ASPECTS}
+        for node in self.engine.nodes.values():
+            if not self._is_micro_branch(node):
+                continue
+            key = node.key.strip()
+            if not key or len(key) <= 1 or key in skip_keys:
+                continue
+            if key in text:
+                return True
+        return False
+
+    def _resolve_micro_candidate(self, update_info: str) -> Optional[str]:
+        text = update_info.strip()
+        if not text:
+            return None
+        for candidate in re.findall(r"\bmicro(?:\.[A-Za-z0-9_]+)+\b", text):
+            node = self.engine.nodes.get(candidate)
+            if node and self._is_micro_branch(node):
+                return candidate
+        aspect_names = {aspect_key for _, aspect_key in MICRO_POLITY_ASPECTS}
+        polity_matches: list[WorldNode] = []
+        for node in self.engine.nodes.values():
+            if not self._is_micro_polity(node):
+                continue
+            key = node.key.strip()
+            if key and len(key) > 1 and key in text:
+                polity_matches.append(node)
+        if polity_matches:
+            polity_matches.sort(
+                key=lambda node: (len(node.key.strip()), node.identifier.count(".")),
+                reverse=True,
+            )
+            polity = polity_matches[0]
+            for aspect_id, aspect_key in MICRO_POLITY_ASPECTS:
+                if aspect_key in text:
+                    aspect_node = self.engine.nodes.get(f"{polity.identifier}.{aspect_id}")
+                    if aspect_node:
+                        return aspect_node.identifier
+            return polity.identifier
+
+        matches: list[str] = []
+        for node in self.engine.nodes.values():
+            if not self._is_micro_branch(node):
+                continue
+            key = node.key.strip()
+            if not key or len(key) < 2 or key in aspect_names:
+                continue
+            if key in text:
+                matches.append(node.identifier)
+        if not matches:
+            return None
+        matches.sort(
+            key=lambda identifier: (identifier.count("."), len(identifier)),
+            reverse=True,
+        )
+        return matches[0]
+
     def _extract_candidate_indices(self, update_info: str) -> list[str]:
         candidates: list[str] = []
         text = update_info.strip()
         if not text:
             return candidates
-        candidates.extend(re.findall(r"\bmicro(?:\.[A-Za-z0-9_]+)+\b", text))
-        candidates.extend(re.findall(r"\b\d+(?:\.\d+)+\b", text))
+        prefer_micro = self._should_prefer_micro(update_info)
+        micro_candidates: list[str] = []
+        macro_candidates: list[str] = []
+        other_candidates: list[str] = []
+        explicit_ids = []
+        explicit_ids.extend(re.findall(r"\bmicro(?:\.[A-Za-z0-9_]+)+\b", text))
+        explicit_ids.extend(re.findall(r"\b\d+(?:\.\d+)+\b", text))
+        for candidate in explicit_ids:
+            node = self.engine.nodes.get(candidate)
+            if not node:
+                other_candidates.append(candidate)
+            elif self._is_micro_branch(node):
+                micro_candidates.append(candidate)
+            elif self._is_macro_branch(node):
+                macro_candidates.append(candidate)
+            else:
+                other_candidates.append(candidate)
         skip_keys = {aspect_key for _, aspect_key in MICRO_POLITY_ASPECTS}
         skip_keys.update({"World", "Macro", "Micro"})
         for node in self.engine.nodes.values():
@@ -571,69 +698,239 @@ class WorldAgent:
             if len(key) < 2:
                 continue
             if key in text:
-                candidates.append(node.identifier)
+                if self._is_micro_branch(node):
+                    micro_candidates.append(node.identifier)
+                elif self._is_macro_branch(node):
+                    macro_candidates.append(node.identifier)
+                else:
+                    other_candidates.append(node.identifier)
+        ordered_groups = [micro_candidates, other_candidates]
+        if not (prefer_micro and micro_candidates):
+            ordered_groups.append(macro_candidates)
+        seen: set[str] = set()
+        for group in ordered_groups:
+            for candidate in group:
+                if candidate in seen:
+                    continue
+                candidates.append(candidate)
+                seen.add(candidate)
         return candidates
 
     def _collect_polity_actions(
         self, update_info: str, max_actions: Optional[int] = None
     ) -> Optional[list[ActionDecision]]:
-        parsed = self._parse_add_polity_command(update_info)
-        if not parsed:
+        intent = self._detect_polity_intent(update_info)
+        if not intent:
             return None
-        region_name, polity_name = parsed
-        if "micro" not in self.engine.nodes:
-            return None
-        region = self._find_micro_region(region_name)
-        if region:
-            actions = [
-                ActionDecision(
-                    flag=ADD_TAG, index=region.identifier, raw="special:add_polity"
+        action, region_name, polity_name = intent
+        if action == "REMOVE":
+            actions = self._build_remove_polity_actions(region_name, polity_name)
+            if actions:
+                if max_actions is not None:
+                    actions = actions[:max_actions]
+                self.logger.info(
+                    "collect_polity_actions removals=%s", len(actions)
                 )
-            ]
-        else:
-            micro = self.engine.view_node("micro")
-            region_key = self._choose_region_key(micro)
-            region_id = f"micro.{region_key}"
-            actions = [
-                ActionDecision(flag=ADD_TAG, index="micro", raw="special:add_region"),
-                ActionDecision(flag=ADD_TAG, index=region_id, raw="special:add_polity"),
-            ]
-        if max_actions is not None and len(actions) > max_actions:
-            self.logger.info(
-                "collect_polity_actions override max_actions=%s actions=%s region=%s polity=%s",
-                max_actions,
-                len(actions),
-                region_name,
-                polity_name,
-            )
-        else:
-            self.logger.info(
-                "collect_polity_actions actions=%s region=%s polity=%s",
-                len(actions),
-                region_name,
-                polity_name,
-            )
-        return actions
+                return actions
+            return None
+        if action == "ADD":
+            actions = self._build_add_polity_actions(region_name, polity_name)
+            if actions:
+                if max_actions is not None and len(actions) > max_actions:
+                    actions = actions[:max_actions]
+                self.logger.info(
+                    "collect_polity_actions additions=%s region=%s polity=%s",
+                    len(actions),
+                    region_name,
+                    polity_name,
+                )
+                return actions
+            return None
+        return None
 
-    def _parse_add_polity_command(
+    def _detect_polity_intent(
         self, update_info: str
-    ) -> Optional[tuple[str, str]]:
+    ) -> Optional[tuple[str, str, str]]:
         text = update_info.strip()
         if not text:
             return None
-        patterns = [
-            r"在\s*[「\"“'](?P<region>[^」\"”']+)[」\"”']\s*(?:地区)?\s*新增\s*[「\"“'](?P<polity>[^」\"”']+)[」\"”']\s*(?:国家|政权)?",
-            r"在\s*(?P<region>[^\s，,。\"“”'「」]+)\s*(?:地区)?\s*新增\s*(?P<polity>[^\s，,。\"“”'「」]+)\s*(?:国家|政权)",
+        prompt = self._build_polity_intent_prompt(update_info)
+        response = self._chat_once(
+            prompt,
+            system_prompt=self._system_prompt(),
+            log_label="POLITY_INTENT",
+        )
+        action, region, polity = self._parse_polity_intent_response(response)
+        if action not in {"ADD", "REMOVE"}:
+            return None
+        if not polity:
+            return None
+        return action, region, polity
+
+    def _build_polity_intent_prompt(self, update_info: str) -> str:
+        regions: list[str] = []
+        polities: list[str] = []
+        if "micro" in self.engine.nodes:
+            for region in self.engine.view_children("micro"):
+                regions.append(f"{region.identifier} {region.key}")
+                for child in region.children.values():
+                    polities.append(f"{child.identifier} {child.key}")
+        region_text = "、".join(regions[:20]) if regions else "无"
+        polity_text = "、".join(polities[:30]) if polities else "无"
+        if len(regions) > 20:
+            region_text = _truncate_text(region_text, limit=800)
+        if len(polities) > 30:
+            polity_text = _truncate_text(polity_text, limit=800)
+        lines = [
+            "【任务】判断剧情是否涉及新增或删除政权/国家。",
+            "如果涉及新增，返回 ACTION=ADD 并给出地区与政权名称；删除同理 ACTION=REMOVE。",
+            "若不涉及或不确定，返回 ACTION=NONE。",
+            "输出必须包含两处冗余，且只输出两行：",
+            "1) ACTION=ADD|REMOVE|NONE; REGION=...; POLITY=...",
+            '2) {"action":"ADD|REMOVE|NONE","region":"...","polity":"...","reason":"..."}',
+            f"剧情信息：{update_info.strip()}",
+            f"现有地区：{region_text}",
+            f"现有政权：{polity_text}",
         ]
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if not match:
+        return "\n".join(lines)
+
+    def _parse_polity_intent_response(self, response: str) -> tuple[str, str, str]:
+        action = ""
+        region = ""
+        polity = ""
+        start = response.find("{")
+        end = response.rfind("}")
+        if start != -1 and end > start:
+            fragment = response[start : end + 1]
+            try:
+                data = json.loads(fragment)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                action = str(data.get("action", "")).strip()
+                region = str(data.get("region", "")).strip()
+                polity = str(data.get("polity", "")).strip()
+
+        if not action or action.upper() == "NONE":
+            line = ""
+            for candidate in response.splitlines():
+                if "ACTION" in candidate.upper():
+                    line = candidate
+                    break
+            if line:
+                line = line.replace("；", ";")
+                parts = [part.strip() for part in line.split(";") if part.strip()]
+                for part in parts:
+                    if "=" in part:
+                        key, value = part.split("=", 1)
+                    elif ":" in part:
+                        key, value = part.split(":", 1)
+                    else:
+                        continue
+                    key = key.strip().upper()
+                    value = value.strip()
+                    if key == "ACTION":
+                        action = value
+                    elif key == "REGION":
+                        region = value
+                    elif key == "POLITY":
+                        polity = value
+
+        action = self._normalize_intent_action(action)
+        region = self._normalize_intent_field(region)
+        polity = self._normalize_intent_field(polity)
+        return action, region, polity
+
+    def _normalize_intent_action(self, action: str) -> str:
+        cleaned = action.strip().upper()
+        if cleaned in {"ADD", "REMOVE", "NONE"}:
+            return cleaned
+        lowered = action.strip().lower()
+        if "新增" in lowered or "创建" in lowered or "建立" in lowered:
+            return "ADD"
+        if "删除" in lowered or "移除" in lowered or "解散" in lowered or "废除" in lowered:
+            return "REMOVE"
+        if "否" in lowered or "无" in lowered:
+            return "NONE"
+        return "NONE"
+
+    def _normalize_intent_field(self, field: str) -> str:
+        cleaned = field.strip()
+        if cleaned.upper() in {"NONE", "NO", "N/A"}:
+            return ""
+        if cleaned in {"无", "没有"}:
+            return ""
+        return cleaned
+
+    def _split_tokens(self, value: str) -> list[str]:
+        cleaned = value.strip()
+        if not cleaned:
+            return []
+        for sep in (",", "，", "、", ";", "；", "|"):
+            cleaned = cleaned.replace(sep, ",")
+        return [token.strip() for token in cleaned.split(",") if token.strip()]
+
+    def _build_add_polity_actions(
+        self, region_name: str, polity_name: str
+    ) -> list[ActionDecision]:
+        if "micro" not in self.engine.nodes:
+            return []
+        polities = self._split_tokens(polity_name)
+        if not polities:
+            return []
+        region = None
+        if region_name:
+            region = self._find_micro_region(region_name)
+        if not region:
+            regions = self.engine.view_children("micro")
+            if len(regions) == 1:
+                region = regions[0]
+        actions: list[ActionDecision] = []
+        if region:
+            for _ in polities:
+                actions.append(
+                    ActionDecision(
+                        flag=ADD_TAG, index=region.identifier, raw="llm:add_polity"
+                    )
+                )
+            return actions
+        if region_name:
+            micro = self.engine.view_node("micro")
+            region_key = self._choose_region_key(micro)
+            region_id = f"micro.{region_key}"
+            actions.append(
+                ActionDecision(flag=ADD_TAG, index="micro", raw="llm:add_region")
+            )
+            for _ in polities:
+                actions.append(
+                    ActionDecision(
+                        flag=ADD_TAG, index=region_id, raw="llm:add_polity"
+                    )
+                )
+        return actions
+
+    def _build_remove_polity_actions(
+        self, region_name: str, polity_name: str
+    ) -> list[ActionDecision]:
+        polities = self._split_tokens(polity_name)
+        if not polities:
+            return []
+        region_hint = ""
+        if region_name:
+            region_hint = self._split_tokens(region_name)[0] if region_name else ""
+        actions: list[ActionDecision] = []
+        for name in polities:
+            try:
+                polity_id = self._resolve_polity_id(name, region_hint or None)
+            except Exception:
                 continue
-            region = match.group("region").strip()
-            polity = match.group("polity").strip()
-            if region and polity:
-                return region, polity
-        return None
+            actions.append(
+                ActionDecision(
+                    flag=REMOVE_TAG, index=polity_id, raw="llm:remove_polity"
+                )
+            )
+        return actions
+
 
     def _find_micro_region(self, region_identifier: str) -> Optional[WorldNode]:
         name = region_identifier.strip()
@@ -752,6 +1049,8 @@ class WorldAgent:
             return ADD_TAG
         if candidate in {UPDATE_TAG, "UPDATE_NODE"}:
             return UPDATE_TAG
+        if candidate in {REMOVE_TAG, "REMOVE_NODE"}:
+            return REMOVE_TAG
         return candidate
 
     def _parse_decision(self, response: str) -> tuple[str, str]:
@@ -763,7 +1062,7 @@ class WorldAgent:
     def _parse_decisions(self, response: str) -> list[tuple[str, str]]:
         actions: list[tuple[str, str]] = []
         for match in re.finditer(
-            r"<\|(ADD_NODE|UPDATE_NODE)\|>\s*[:：]\s*([^\s,;]+)",
+            r"<\|(ADD_NODE|UPDATE_NODE|REMOVE_NODE)\|>\s*[:：]\s*([^\s,;]+)",
             response,
         ):
             flag = f"<|{match.group(1)}|>"
@@ -785,7 +1084,7 @@ class WorldAgent:
                         continue
                     action = str(item.get("action", "")).strip().upper()
                     index = str(item.get("index", "")).strip()
-                    if action in {"ADD_NODE", "UPDATE_NODE"} and index:
+                    if action in {"ADD_NODE", "UPDATE_NODE", "REMOVE_NODE"} and index:
                         actions.append((f"<|{action}|>", index))
 
         for match in re.finditer(r"\{.*?\}", response, flags=re.DOTALL):
@@ -795,7 +1094,7 @@ class WorldAgent:
                 continue
             action = str(data.get("action", "")).strip().upper()
             index = str(data.get("index", "")).strip()
-            if action in {"ADD_NODE", "UPDATE_NODE"} and index:
+            if action in {"ADD_NODE", "UPDATE_NODE", "REMOVE_NODE"} and index:
                 actions.append((f"<|{action}|>", index))
 
         return actions

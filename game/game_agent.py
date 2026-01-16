@@ -231,6 +231,16 @@ class GameAgent:
                 world_nodes,
                 updated_ids,
             )
+            updated_ids.update(item.identifier for item in extra_decisions)
+            removal_decisions, removal_records = (
+                self._maybe_update_characters_for_polity_removals(
+                    update_info,
+                    world_decisions,
+                    updated_ids,
+                )
+            )
+            extra_decisions.extend(removal_decisions)
+            extra_records.extend(removal_records)
         if extra_decisions:
             result.character_decisions.extend(extra_decisions)
             result.character_records.extend(extra_records)
@@ -320,6 +330,7 @@ class GameAgent:
             "【任务】判断是否需要更新世界设定或角色档案",
             "世界更新：当剧情涉及地理、势力、政权、制度、重大事件变化。",
             "角色更新：当剧情涉及角色状态、关系、动机、能力变化。",
+            "如果剧情涉及地区/国家/政权/城市等具体实体，应判定世界更新。",
             "输出必须包含两处冗余，且只输出两行：",
             "1) WORLD=YES/NO; CHARACTER=YES/NO",
             '2) {"update_world":true|false,"update_characters":true|false,"reason":"..."}',
@@ -346,10 +357,7 @@ class GameAgent:
             )
         if not read_context and self.world_agent and self.world_agent.engine.nodes:
             lines.append("现有世界节点：")
-            nodes = sorted(
-                self.world_agent.engine.nodes.values(),
-                key=lambda item: item.identifier,
-            )
+            nodes = self._iter_world_nodes_prefer_micro()
             items = [
                 self._format_world_context_item(
                     node, limit=DEFAULT_SEARCH_CONTEXT_LIMIT
@@ -377,6 +385,8 @@ class GameAgent:
             "【任务】搜索需要读取的世界节点与角色",
             f"每轮最多选择 {max_items} 个世界节点、{max_items} 个角色。",
             "仅选择确实需要读取的条目，用于后续决策。",
+            "若涉及地区/国家/政权/城市等具体实体，优先选择 micro.* 节点。",
+            "宏观节点仅用于世界法则、文明阶段、宏观主题等变更。",
             "输出必须包含两处冗余，且只输出两行：",
             "1) WORLD=id1,id2; CHARACTER=c1,c2",
             '2) {"world":["id1","id2"],"characters":["c1","c2"],"reason":"..."}',
@@ -388,10 +398,7 @@ class GameAgent:
             lines.append(f"需要补充的上下文：{search_hint}")
         if self.world_agent and self.world_agent.engine.nodes:
             lines.append("可用世界节点：")
-            nodes = sorted(
-                self.world_agent.engine.nodes.values(),
-                key=lambda item: item.identifier,
-            )
+            nodes = self._iter_world_nodes_prefer_micro()
             items = [self._format_world_list_item(node) for node in nodes]
             lines.extend(
                 self._pack_items(
@@ -544,6 +551,28 @@ class GameAgent:
     def _compact_text(self, text: str) -> str:
         return " ".join(text.split())
 
+    def _is_micro_identifier(self, identifier: str) -> bool:
+        return identifier == "micro" or identifier.startswith("micro.")
+
+    def _is_macro_identifier(self, identifier: str) -> bool:
+        return identifier == "macro" or (identifier and identifier[0].isdigit())
+
+    def _iter_world_nodes_prefer_micro(self) -> list[WorldNode]:
+        if not self.world_agent:
+            return []
+        nodes = list(self.world_agent.engine.nodes.values())
+        return sorted(
+            nodes,
+            key=lambda node: (
+                0
+                if self._is_micro_identifier(node.identifier)
+                else 2
+                if self._is_macro_identifier(node.identifier)
+                else 1,
+                node.identifier,
+            ),
+        )
+
     def _pack_items(self, label: str, items: list[str], max_line_len: int) -> list[str]:
         lines: list[str] = []
         prefix = f"{label}: "
@@ -627,6 +656,45 @@ class GameAgent:
         if not joined:
             return ""
         return f"关联政权更新：{joined}"
+
+    def _is_micro_polity_identifier(self, identifier: str) -> bool:
+        if not identifier.startswith("micro."):
+            return False
+        parts = identifier.split(".")
+        return len(parts) >= 3 and parts[2].startswith("p")
+
+    def _resolve_polity_identifier(self, identifier: str) -> Optional[str]:
+        if not identifier.startswith("micro."):
+            return None
+        parts = identifier.split(".")
+        if len(parts) >= 3 and parts[2].startswith("p"):
+            return ".".join(parts[:3])
+        return None
+
+    def _collect_removed_polity_ids(
+        self, world_decisions: list[ActionDecision]
+    ) -> list[str]:
+        removed: list[str] = []
+        for decision in world_decisions:
+            if self._normalize_action_name(decision.flag) != "REMOVE_NODE":
+                continue
+            polity_id = self._resolve_polity_identifier(decision.index)
+            if polity_id and self._is_micro_polity_identifier(polity_id):
+                removed.append(polity_id)
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for polity_id in removed:
+            if polity_id in seen:
+                continue
+            ordered.append(polity_id)
+            seen.add(polity_id)
+        return ordered
+
+    def _build_polity_removal_context(self, polity_ids: list[str]) -> str:
+        if not polity_ids:
+            return ""
+        items = "、".join(polity_ids)
+        return f"关联政权删除：{items}"
 
     def _apply_polity_merge(self, update_info: str) -> Optional[GameUpdateResult]:
         if not self.world_agent or not self.character_agent:
@@ -982,6 +1050,8 @@ class GameAgent:
             return "ADD_NODE"
         if "UPDATE_NODE" in cleaned:
             return "UPDATE_NODE"
+        if "REMOVE_NODE" in cleaned:
+            return "REMOVE_NODE"
         if "ADD_CHARACTER" in cleaned:
             return "ADD_CHARACTER"
         if "UPDATE_CHARACTER" in cleaned:
@@ -1201,6 +1271,53 @@ class GameAgent:
         )
         return decisions, records
 
+    def _maybe_update_characters_for_polity_removals(
+        self,
+        update_info: str,
+        world_decisions: list[ActionDecision],
+        skip_ids: set[str],
+    ) -> tuple[list[CharacterActionDecision], list[CharacterRecord]]:
+        if not self.character_agent:
+            return [], []
+        removed_polity_ids = self._collect_removed_polity_ids(world_decisions)
+        if not removed_polity_ids:
+            return [], []
+        candidates = [
+            record
+            for record in self.character_agent.engine.records
+            if record.polity_id in removed_polity_ids
+        ]
+        if not candidates:
+            return [], []
+        context = self._build_polity_removal_context(removed_polity_ids)
+        update_payload = (
+            f"{update_info.strip()}\n{context}\n"
+            "请更新角色档案以反映政权被删除后的影响。"
+        )
+        decisions: list[CharacterActionDecision] = []
+        records: list[CharacterRecord] = []
+        for record in candidates:
+            if record.identifier in skip_ids:
+                continue
+            record.polity_id = None
+            decision = CharacterActionDecision(
+                flag=CHARACTER_UPDATE_TAG,
+                identifier=record.identifier,
+                raw="polity_remove",
+            )
+            updated = self.character_agent.apply_update(
+                decision.flag, decision.identifier, update_payload
+            )
+            decisions.append(decision)
+            records.append(updated)
+        self.logger.info(
+            "polity_character_removals polities=%s candidates=%s updated=%s",
+            len(removed_polity_ids),
+            len(candidates),
+            len(decisions),
+        )
+        return decisions, records
+
     def _read_world_nodes(
         self,
         identifiers: list[str],
@@ -1259,6 +1376,10 @@ class GameAgent:
             matches = key_lookup.get(token) or []
             if len(matches) == 1:
                 resolved.append(matches[0])
+                continue
+            micro_matches = [item for item in matches if self._is_micro_identifier(item)]
+            if len(micro_matches) == 1:
+                resolved.append(micro_matches[0])
         return resolved[:DEFAULT_SEARCH_LIMIT]
 
     def _resolve_character_identifiers(self, identifiers: list[str]) -> list[str]:
@@ -1304,10 +1425,7 @@ class GameAgent:
         text = update_info.strip()
         world_ids: list[str] = []
         if self.world_agent:
-            nodes = sorted(
-                self.world_agent.engine.nodes.values(),
-                key=lambda item: item.identifier,
-            )
+            nodes = self._iter_world_nodes_prefer_micro()
             for node in nodes:
                 key = node.key.strip()
                 if key and key in text:
@@ -1359,16 +1477,24 @@ class GameAgent:
         world_keywords = [
             "世界",
             "地区",
+            "区域",
+            "国家",
             "城市",
+            "城邦",
             "王国",
             "政权",
             "势力",
+            "政体",
             "战争",
             "灾难",
             "制度",
             "法律",
             "资源",
             "科技",
+            "共和国",
+            "联邦",
+            "帝国",
+            "公国",
         ]
         character_keywords = [
             "角色",
