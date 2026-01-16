@@ -21,6 +21,21 @@ UPDATE_TAG = "<|UPDATE_CHARACTER|>"
 DEFAULT_LOG_PATH = Path("log") / "character_agent.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(message)s"
 DEFAULT_MAX_ACTIONS = 3
+REQUIRED_PROFILE_FIELDS = (
+    "name",
+    "summary",
+    "background",
+    "motivation",
+    "conflict",
+    "abilities",
+    "weaknesses",
+    "relationships",
+    "hooks",
+    "faction",
+    "profession",
+    "species",
+    "tier",
+)
 
 
 def _truncate_text(text: str, limit: int = 800) -> str:
@@ -262,6 +277,7 @@ class CharacterAgent:
                 "只输出更新后的角色 JSON，不要解释或 Markdown。",
                 "JSON 字段固定为: name, summary, background, motivation, conflict, "
                 "abilities, weaknesses, relationships, hooks, faction, profession, species, tier。",
+                "必须输出完整 JSON，包含所有字段；未变更字段保持原值。",
                 f"角色ID: {record.identifier}",
                 f"已有档案: {original}",
                 f"剧情信息: {update_info.strip()}",
@@ -276,7 +292,7 @@ class CharacterAgent:
             prompt, system_prompt=self._system_prompt(), log_label="CHARACTER_UPDATE"
         )
         profile = self._parse_profile(response)
-        record.profile = profile
+        record.profile = self._normalize_profile_update(profile, record.profile)
         return record
 
     def _apply_add(self, identifier: str, update_info: str) -> CharacterRecord:
@@ -391,6 +407,29 @@ class CharacterAgent:
         if isinstance(profile, dict):
             return json.dumps(profile, ensure_ascii=False, separators=(",", ":"))
         return str(profile or "")
+
+    def _normalize_profile_update(
+        self,
+        profile: Dict[str, object] | str,
+        original: Dict[str, object] | str,
+    ) -> Dict[str, object] | str:
+        if not isinstance(profile, dict):
+            if isinstance(original, dict):
+                return original
+            return profile
+        original_data = original if isinstance(original, dict) else {}
+        normalized: Dict[str, object] = {}
+        for key in REQUIRED_PROFILE_FIELDS:
+            value = profile.get(key)
+            if value is None:
+                value = original_data.get(key, "")
+            if isinstance(value, str):
+                if not value.strip():
+                    fallback = original_data.get(key, "")
+                    if isinstance(fallback, str) and fallback.strip():
+                        value = fallback
+            normalized[key] = value
+        return normalized
 
     def _parse_profile(self, output: str) -> Dict[str, object] | str:
         cleaned = output.strip()
