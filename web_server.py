@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 from character.character_agent import CharacterAgent
 from character.character_engine import CharacterEngine, CharacterRecord, CharacterRequest
 from game.game_agent import GameAgent
+from game.history_engine import HistoryEngine
 from llm_api.llm_client import LLMClient
 from world.world_agent import WorldAgent
 from world.world_engine import WorldEngine, WorldNode
@@ -22,6 +23,7 @@ from world.world_engine import WorldEngine, WorldNode
 BASE_DIR = Path(__file__).resolve().parent
 WEB_ROOT = BASE_DIR / "web"
 SAVE_ROOT = BASE_DIR / "save"
+HISTORY_SAVE_ROOT = SAVE_ROOT / "history"
 WORLD_SPEC = BASE_DIR / "world" / "world_spec.md"
 DEFAULT_LOG_PATH = Path("log") / "web_server.log"
 
@@ -859,9 +861,11 @@ class RequestHandler(SimpleHTTPRequestHandler):
 
             world_agent = WorldAgent(world_engine, llm_client=llm_client)
             character_agent = CharacterAgent(character_engine, llm_client=llm_client)
+            history_engine = HistoryEngine(save_root=HISTORY_SAVE_ROOT)
             game_agent = GameAgent(
                 world_agent=world_agent,
                 character_agent=character_agent,
+                history_engine=history_engine,
                 llm_client=llm_client,
             )
 
@@ -871,12 +875,22 @@ class RequestHandler(SimpleHTTPRequestHandler):
             current_snapshot = snapshot
             world_save_path = snapshot_path
             character_save_path = character_snapshot_path
+            history_save_path: Optional[Path] = None
+            world_decisions = []
+            world_nodes: list[WorldNode] = []
+            character_decisions = []
+            character_records: list[CharacterRecord] = []
+            if apply_updates:
+                world_snapshot_before = game_agent._snapshot_world()
+                character_snapshot_before = game_agent._snapshot_characters()
+            else:
+                world_snapshot_before = {}
+                character_snapshot_before = {}
             if decision.update_world:
                 if hasattr(world_agent, "collect_actions"):
                     world_decisions = world_agent.collect_actions(text)
                 else:
                     world_decisions = world_agent.decide_actions(text)
-                world_nodes: list[WorldNode] = []
                 if apply_updates:
                     world_nodes = world_agent.apply_updates(world_decisions, text)
                     current_snapshot = world_engine.as_dict()
@@ -917,7 +931,6 @@ class RequestHandler(SimpleHTTPRequestHandler):
                     character_engine.set_world_snapshot(current_snapshot)
                 if world_save_path:
                     character_engine.world_snapshot_path = world_save_path
-                character_records: list[CharacterRecord] = []
                 if apply_updates:
                     character_records = character_agent.apply_updates(
                         character_decisions, text
@@ -960,6 +973,28 @@ class RequestHandler(SimpleHTTPRequestHandler):
                         }
                     )
 
+            if apply_updates:
+                decision_payload = {
+                    "update_world": decision.update_world,
+                    "update_characters": decision.update_characters,
+                    "reason": decision.reason,
+                }
+                history_world_changes = game_agent._build_world_changes(
+                    world_decisions, world_nodes, world_snapshot_before
+                )
+                history_character_changes = game_agent._build_character_changes(
+                    character_decisions,
+                    character_records,
+                    character_snapshot_before,
+                )
+                history_engine.record(
+                    text,
+                    decision_payload,
+                    history_world_changes,
+                    history_character_changes,
+                )
+                history_save_path = history_engine.last_save_path
+
             response = {
                 "ok": True,
                 "decision": {
@@ -972,6 +1007,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
                 "context": {
                     "world_snapshot": _format_save_path(world_save_path) or "当前内存快照",
                     "character_snapshot": _format_save_path(character_save_path),
+                    "history_save_path": _format_save_path(history_save_path),
                     "character_count": len(character_engine.records),
                 },
             }

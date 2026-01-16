@@ -719,38 +719,48 @@ class WorldAgent:
     def _collect_polity_actions(
         self, update_info: str, max_actions: Optional[int] = None
     ) -> Optional[list[ActionDecision]]:
-        intent = self._detect_polity_intent(update_info)
-        if not intent:
+        intents = self._detect_polity_intent(update_info)
+        if not intents:
             return None
-        action, region_name, polity_name = intent
-        if action == "REMOVE":
-            actions = self._build_remove_polity_actions(region_name, polity_name)
-            if actions:
-                if max_actions is not None:
-                    actions = actions[:max_actions]
-                self.logger.info(
-                    "collect_polity_actions removals=%s", len(actions)
-                )
-                return actions
+        add_targets: dict[str, list[str]] = {}
+        remove_targets: dict[str, list[str]] = {}
+        for action, region_name, polity_name in intents:
+            if not polity_name:
+                continue
+            if action == "ADD":
+                add_targets.setdefault(region_name, []).append(polity_name)
+            elif action == "REMOVE":
+                remove_targets.setdefault(region_name, []).append(polity_name)
+        actions: list[ActionDecision] = []
+        for region_name, polities in add_targets.items():
+            combined = self._combine_polity_names(polities)
+            actions.extend(self._build_add_polity_actions(region_name, combined))
+        for region_name, polities in remove_targets.items():
+            combined = self._combine_polity_names(polities)
+            actions.extend(self._build_remove_polity_actions(region_name, combined))
+        if not actions:
             return None
-        if action == "ADD":
-            actions = self._build_add_polity_actions(region_name, polity_name)
-            if actions:
-                if max_actions is not None and len(actions) > max_actions:
-                    actions = actions[:max_actions]
-                self.logger.info(
-                    "collect_polity_actions additions=%s region=%s polity=%s",
-                    len(actions),
-                    region_name,
-                    polity_name,
-                )
-                return actions
-            return None
-        return None
+        if max_actions is not None and len(actions) > max_actions:
+            actions = actions[:max_actions]
+        self.logger.info(
+            "collect_polity_actions additions=%s removals=%s total=%s",
+            sum(
+                len(self._split_tokens(name))
+                for polities in add_targets.values()
+                for name in polities
+            ),
+            sum(
+                len(self._split_tokens(name))
+                for polities in remove_targets.values()
+                for name in polities
+            ),
+            len(actions),
+        )
+        return actions
 
     def _detect_polity_intent(
         self, update_info: str
-    ) -> Optional[tuple[str, str, str]]:
+    ) -> Optional[list[tuple[str, str, str]]]:
         text = update_info.strip()
         if not text:
             return None
@@ -760,12 +770,15 @@ class WorldAgent:
             system_prompt=self._system_prompt(),
             log_label="POLITY_INTENT",
         )
-        action, region, polity = self._parse_polity_intent_response(response)
-        if action not in {"ADD", "REMOVE"}:
-            return None
-        if not polity:
-            return None
-        return action, region, polity
+        intents = self._parse_polity_intent_response(response)
+        valid: list[tuple[str, str, str]] = []
+        for action, region, polity in intents:
+            if action not in {"ADD", "REMOVE"}:
+                continue
+            if not polity:
+                continue
+            valid.append((action, region, polity))
+        return valid or None
 
     def _build_polity_intent_prompt(self, update_info: str) -> str:
         regions: list[str] = []
@@ -783,63 +796,216 @@ class WorldAgent:
             polity_text = _truncate_text(polity_text, limit=800)
         lines = [
             "【任务】判断剧情是否涉及新增或删除政权/国家。",
-            "如果涉及新增，返回 ACTION=ADD 并给出地区与政权名称；删除同理 ACTION=REMOVE。",
+            "如果涉及新增/删除，给出地区-政权的多组列表；删除同理 ACTION=REMOVE。",
             "若不涉及或不确定，返回 ACTION=NONE。",
             "输出必须包含两处冗余，且只输出两行：",
-            "1) ACTION=ADD|REMOVE|NONE; REGION=...; POLITY=...",
-            '2) {"action":"ADD|REMOVE|NONE","region":"...","polity":"...","reason":"..."}',
+            "1) ACTION=ADD|REMOVE|NONE; ITEMS=地区A-政权1、政权2|地区B-政权3",
+            (
+                '2) {"action":"ADD|REMOVE|NONE","items":['
+                '{"region":"...","polity":"..."},...],"reason":"..."}'
+            ),
             f"剧情信息：{update_info.strip()}",
             f"现有地区：{region_text}",
             f"现有政权：{polity_text}",
         ]
         return "\n".join(lines)
 
-    def _parse_polity_intent_response(self, response: str) -> tuple[str, str, str]:
+    def _parse_polity_intent_response(self, response: str) -> list[tuple[str, str, str]]:
+        intents: list[tuple[str, str, str]] = []
+        payload = self._extract_polity_intent_payload(response)
+        if isinstance(payload, dict):
+            intents.extend(self._parse_intent_payload_dict(payload))
+        elif isinstance(payload, list):
+            intents.extend(self._parse_intent_items(payload, default_action=""))
+        if not intents:
+            intents.extend(self._parse_polity_intent_line(response))
+        normalized: list[tuple[str, str, str]] = []
+        for action, region, polity in intents:
+            action = self._normalize_intent_action(action)
+            region = self._normalize_intent_field(region)
+            polity = self._normalize_intent_field(polity)
+            if action == "NONE":
+                continue
+            normalized.append((action, region, polity))
+        return normalized
+
+    def _extract_polity_intent_payload(self, response: str) -> Optional[object]:
+        candidates: list[str] = []
+        for line in response.splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            if (cleaned.startswith("{") and cleaned.endswith("}")) or (
+                cleaned.startswith("[") and cleaned.endswith("]")
+            ):
+                candidates.append(cleaned)
+        if "{" in response and "}" in response:
+            start = response.find("{")
+            end = response.rfind("}")
+            if start != -1 and end > start:
+                candidates.append(response[start : end + 1])
+        if "[" in response and "]" in response:
+            start = response.find("[")
+            end = response.rfind("]")
+            if start != -1 and end > start:
+                candidates.append(response[start : end + 1])
+        for fragment in candidates:
+            try:
+                return json.loads(fragment)
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    def _parse_intent_payload_dict(
+        self, payload: dict[str, object]
+    ) -> list[tuple[str, str, str]]:
+        action = str(payload.get("action", "")).strip()
+        items = payload.get("items")
+        if items is None:
+            for key in ("pairs", "list"):
+                if key in payload:
+                    items = payload.get(key)
+                    break
+        intents: list[tuple[str, str, str]] = []
+        if isinstance(items, list):
+            intents.extend(self._parse_intent_items(items, default_action=action))
+        elif isinstance(items, str):
+            pairs = self._parse_region_polity_items(items)
+            for region, polity in pairs:
+                intents.append((action, region, polity))
+        else:
+            region = str(payload.get("region", "")).strip()
+            polity = str(payload.get("polity", "")).strip()
+            if not polity:
+                alt = payload.get("polity_name") or payload.get("country") or payload.get("nation")
+                if alt:
+                    polity = str(alt).strip()
+            if not region:
+                alt = payload.get("region_name") or payload.get("area")
+                if alt:
+                    region = str(alt).strip()
+            pair = payload.get("pair")
+            if pair and isinstance(pair, str):
+                region, polity = self._parse_region_polity_token(pair)
+            if region or polity:
+                intents.append((action, region, polity))
+        return intents
+
+    def _parse_intent_items(
+        self, items: list[object], default_action: str
+    ) -> list[tuple[str, str, str]]:
+        intents: list[tuple[str, str, str]] = []
+        for item in items:
+            if isinstance(item, dict):
+                action = str(item.get("action", default_action)).strip() or default_action
+                region = str(item.get("region", "")).strip()
+                polity = str(item.get("polity", "")).strip()
+                if not polity:
+                    alt = item.get("polity_name") or item.get("country") or item.get("nation")
+                    if alt:
+                        polity = str(alt).strip()
+                if not region:
+                    alt = item.get("region_name") or item.get("area")
+                    if alt:
+                        region = str(alt).strip()
+                pair = item.get("pair")
+                if pair and isinstance(pair, str):
+                    region, polity = self._parse_region_polity_token(pair)
+                if region or polity:
+                    intents.append((action, region, polity))
+                continue
+            if isinstance(item, str):
+                region, polity = self._parse_region_polity_token(item)
+                intents.append((default_action, region, polity))
+                continue
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                region = str(item[0]).strip()
+                polity = str(item[1]).strip()
+                intents.append((default_action, region, polity))
+        return intents
+
+    def _parse_polity_intent_line(self, response: str) -> list[tuple[str, str, str]]:
+        line = ""
+        for candidate in response.splitlines():
+            if "ACTION" in candidate.upper():
+                line = candidate
+                break
+        if not line:
+            return []
+        line = line.replace("；", ";")
+        parts = [part.strip() for part in line.split(";") if part.strip()]
         action = ""
         region = ""
         polity = ""
-        start = response.find("{")
-        end = response.rfind("}")
-        if start != -1 and end > start:
-            fragment = response[start : end + 1]
-            try:
-                data = json.loads(fragment)
-            except json.JSONDecodeError:
-                data = None
-            if isinstance(data, dict):
-                action = str(data.get("action", "")).strip()
-                region = str(data.get("region", "")).strip()
-                polity = str(data.get("polity", "")).strip()
+        items = ""
+        for part in parts:
+            key, value = self._split_intent_kv(part)
+            if not key:
+                continue
+            if key == "ACTION":
+                action = value
+            elif key == "REGION":
+                region = value
+            elif key == "POLITY":
+                polity = value
+            elif key in {"ITEMS", "PAIRS", "LIST"}:
+                items = value
+        if items:
+            intents: list[tuple[str, str, str]] = []
+            for region_name, polity_name in self._parse_region_polity_items(items):
+                intents.append((action, region_name, polity_name))
+            return intents
+        if region or polity:
+            return [(action, region, polity)]
+        return []
 
-        if not action or action.upper() == "NONE":
-            line = ""
-            for candidate in response.splitlines():
-                if "ACTION" in candidate.upper():
-                    line = candidate
-                    break
-            if line:
-                line = line.replace("；", ";")
-                parts = [part.strip() for part in line.split(";") if part.strip()]
-                for part in parts:
-                    if "=" in part:
-                        key, value = part.split("=", 1)
-                    elif ":" in part:
-                        key, value = part.split(":", 1)
-                    else:
-                        continue
-                    key = key.strip().upper()
-                    value = value.strip()
-                    if key == "ACTION":
-                        action = value
-                    elif key == "REGION":
-                        region = value
-                    elif key == "POLITY":
-                        polity = value
+    def _split_intent_kv(self, part: str) -> tuple[str, str]:
+        if "=" in part:
+            key, value = part.split("=", 1)
+        elif ":" in part:
+            key, value = part.split(":", 1)
+        else:
+            return "", ""
+        return key.strip().upper(), value.strip()
 
-        action = self._normalize_intent_action(action)
-        region = self._normalize_intent_field(region)
-        polity = self._normalize_intent_field(polity)
-        return action, region, polity
+    def _parse_region_polity_items(self, items: str) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        for token in self._split_pair_items(items):
+            region, polity = self._parse_region_polity_token(token)
+            if region or polity:
+                pairs.append((region, polity))
+        return pairs
+
+    def _split_pair_items(self, items: str) -> list[str]:
+        cleaned = items.strip()
+        if not cleaned:
+            return []
+        for sep in ("\n", ";", "；"):
+            cleaned = cleaned.replace(sep, "|")
+        if "|" in cleaned:
+            return [part.strip() for part in cleaned.split("|") if part.strip()]
+        return [cleaned]
+
+    def _parse_region_polity_token(self, token: str) -> tuple[str, str]:
+        cleaned = token.strip()
+        if not cleaned:
+            return "", ""
+        for sep in ("->", "=>", "—", "–", "-", ":", "：", "="):
+            if sep in cleaned:
+                left, right = cleaned.split(sep, 1)
+                return left.strip(), right.strip()
+        return "", cleaned
+
+    def _combine_polity_names(self, names: list[str]) -> str:
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            for token in self._split_tokens(name):
+                if token in seen:
+                    continue
+                tokens.append(token)
+                seen.add(token)
+        return "、".join(tokens)
 
     def _normalize_intent_action(self, action: str) -> str:
         cleaned = action.strip().upper()

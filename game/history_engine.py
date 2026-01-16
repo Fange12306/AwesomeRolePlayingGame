@@ -11,6 +11,7 @@ from typing import Any, Iterable, Optional
 from llm_api.llm_client import LLMClient
 
 DEFAULT_LOG_PATH = Path("log") / "history.jsonl"
+DEFAULT_ENGINE_LOG_PATH = Path("log") / "history_engine.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d %(message)s"
 
 
@@ -19,8 +20,8 @@ def _get_logger() -> logging.Logger:
     if logger.handlers:
         return logger
     logger.setLevel(logging.INFO)
-    DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")
+    DEFAULT_ENGINE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(DEFAULT_ENGINE_LOG_PATH, encoding="utf-8")
     formatter = logging.Formatter(LOG_FORMAT)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -74,12 +75,15 @@ class HistoryEngine:
     def __init__(
         self,
         log_path: Optional[str | Path] = None,
+        save_root: Optional[str | Path] = None,
         llm_client: Optional[LLMClient] = None,
     ) -> None:
         self.logger = _get_logger()
         self.log_path = Path(log_path) if log_path else DEFAULT_LOG_PATH
+        self.save_root = Path(save_root) if save_root else None
         self.llm_client = llm_client
         self.entries: list[HistoryEntry] = []
+        self.last_save_path: Optional[Path] = None
 
     def record(
         self,
@@ -102,6 +106,7 @@ class HistoryEngine:
         entry.summary = summary or self._build_summary(entry, use_llm=use_llm_summary)
         self.entries.append(entry)
         self._write_entry(entry)
+        self._write_snapshot(entry)
         self.logger.info(
             "history_record id=%s world=%s characters=%s summary_len=%s",
             entry.entry_id,
@@ -206,6 +211,23 @@ class HistoryEngine:
                 handle.write(payload + "\n")
         except Exception:
             self.logger.exception("history_write_failed entry_id=%s", entry.entry_id)
+
+    def _write_snapshot(self, entry: HistoryEntry) -> None:
+        if not self.save_root:
+            return
+        try:
+            self.save_root.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = self.save_root / f"history_{timestamp}_{entry.entry_id}.json"
+            payload = json.dumps(
+                entry.to_dict(), ensure_ascii=False, separators=(",", ":")
+            )
+            path.write_text(payload, encoding="utf-8")
+            self.last_save_path = path
+        except Exception:
+            self.logger.exception(
+                "history_snapshot_write_failed entry_id=%s", entry.entry_id
+            )
 
     def _parse_change(self, payload: dict[str, Any]) -> HistoryChange:
         return HistoryChange(
