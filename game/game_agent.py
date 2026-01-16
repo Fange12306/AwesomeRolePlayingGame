@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -13,6 +14,7 @@ from character.character_agent import (
     UPDATE_TAG as CHARACTER_UPDATE_TAG,
 )
 from character.character_engine import CharacterRecord
+from game.history_engine import HistoryChange, HistoryEngine
 from llm_api.llm_client import LLMClient
 from world.world_agent import ActionDecision, WorldAgent, UPDATE_TAG as WORLD_UPDATE_TAG
 from world.world_engine import WorldNode
@@ -78,10 +80,12 @@ class GameAgent:
         self,
         world_agent: Optional[WorldAgent] = None,
         character_agent: Optional[CharacterAgent] = None,
+        history_engine: Optional[HistoryEngine] = None,
         llm_client: Optional[LLMClient] = None,
     ) -> None:
         self.world_agent = world_agent
         self.character_agent = character_agent
+        self.history_engine = history_engine
         self.logger = _get_logger()
         try:
             if llm_client:
@@ -141,8 +145,11 @@ class GameAgent:
             raise
 
     def apply_update(self, update_info: str) -> GameUpdateResult:
+        world_snapshot = self._snapshot_world()
+        character_snapshot = self._snapshot_characters()
         merge_result = self._apply_polity_merge(update_info)
         if merge_result:
+            self._record_history(update_info, merge_result, world_snapshot, character_snapshot)
             return merge_result
         search_state = self._run_search_and_read(update_info)
         read_context = self._build_read_context_lines(
@@ -210,6 +217,14 @@ class GameAgent:
             result.world_nodes = world_nodes
             result.world_decision = world_decisions[0] if world_decisions else None
             result.world_node = world_nodes[0] if world_nodes else None
+            region_decisions, region_nodes = self._maybe_update_children_for_region_updates(
+                update_info, world_decisions, world_nodes, world_snapshot
+            )
+            if region_decisions:
+                result.world_decisions.extend(region_decisions)
+                result.world_nodes.extend(region_nodes)
+                world_decisions = result.world_decisions
+                world_nodes = result.world_nodes
         else:
             world_nodes = []
         if decision.update_characters and char_decisions:
@@ -255,6 +270,7 @@ class GameAgent:
                     raw=result.decision.raw,
                     reason=(result.decision.reason + ";polity_check").strip(";"),
                 )
+        self._record_history(update_info, result, world_snapshot, character_snapshot)
         return result
 
     # Search & read ------------------------------------------------------
@@ -729,6 +745,9 @@ class GameAgent:
         updated_node = self.world_agent.apply_update(
             WORLD_UPDATE_TAG, keep_id, update_payload
         )
+        aspect_nodes = self._apply_polity_merge_aspect_updates(
+            update_info, keep_node, remove_node
+        )
         removed = self.world_agent.remove_polity(remove_id)
 
         decision = GameUpdateDecision(
@@ -742,6 +761,16 @@ class GameAgent:
             ActionDecision(flag=WORLD_UPDATE_TAG, index=keep_id, raw=response)
         ]
         result.world_nodes = [updated_node]
+        if aspect_nodes:
+            for node in aspect_nodes:
+                result.world_decisions.append(
+                    ActionDecision(
+                        flag=WORLD_UPDATE_TAG,
+                        index=node.identifier,
+                        raw="polity_merge_aspect",
+                    )
+                )
+                result.world_nodes.append(node)
         result.world_decision = result.world_decisions[0]
         result.world_node = updated_node
 
@@ -806,6 +835,25 @@ class GameAgent:
             decisions.append(decision)
             records.append(updated)
         return decisions, records
+
+    def _apply_polity_merge_aspect_updates(
+        self,
+        update_info: str,
+        keep_node: WorldNode,
+        remove_node: WorldNode,
+    ) -> list[WorldNode]:
+        if not self.world_agent or not keep_node.children:
+            return []
+        updated: list[WorldNode] = []
+        for child in keep_node.children.values():
+            payload = self._build_polity_merge_aspect_payload(
+                update_info, keep_node, remove_node, child
+            )
+            node = self.world_agent.apply_update(
+                WORLD_UPDATE_TAG, child.identifier, payload
+            )
+            updated.append(node)
+        return updated
 
     def _list_micro_polities(self) -> list[WorldNode]:
         if not self.world_agent:
@@ -973,8 +1021,24 @@ class GameAgent:
             )
         return "\n".join(line for line in lines if line)
 
+    def _build_polity_merge_aspect_payload(
+        self,
+        update_info: str,
+        keep_node: WorldNode,
+        remove_node: WorldNode,
+        aspect_node: WorldNode,
+    ) -> str:
+        context = self._build_polity_merge_context(keep_node, remove_node)
+        return (
+            f"{update_info.strip()}\n{context}\n"
+            f"请更新该政权子节点「{aspect_node.key}」的描述，反映合并后的变化。"
+        )
+
     def _is_micro_polity(self, node: WorldNode) -> bool:
         return bool(node.parent and node.parent.parent and node.parent.parent.identifier == "micro")
+
+    def _is_micro_region(self, node: WorldNode) -> bool:
+        return bool(node.parent and node.parent.identifier == "micro")
 
     def _resolve_polity_from_node(self, node: WorldNode) -> Optional[WorldNode]:
         if self._is_micro_polity(node):
@@ -999,6 +1063,168 @@ class GameAgent:
             if polity:
                 polities[polity.identifier] = polity
         return list(polities.values())
+
+    def _collect_updated_regions(
+        self,
+        world_decisions: list[ActionDecision],
+        world_nodes: list[WorldNode],
+        world_snapshot: dict[str, Dict[str, object]],
+    ) -> list[WorldNode]:
+        regions: dict[str, WorldNode] = {}
+        for idx, decision in enumerate(world_decisions):
+            if self._normalize_action_name(decision.flag) != "UPDATE_NODE":
+                continue
+            node = world_nodes[idx] if idx < len(world_nodes) else None
+            if not node or not self._is_micro_region(node):
+                continue
+            before = world_snapshot.get(node.identifier)
+            if not self._region_changed(node, before):
+                continue
+            regions[node.identifier] = node
+        return list(regions.values())
+
+    def _region_changed(
+        self, node: WorldNode, before: Optional[Dict[str, object]]
+    ) -> bool:
+        if not before:
+            return True
+        old_key = str(before.get("key", "")).strip()
+        old_value = str(before.get("value", "")).strip()
+        new_key = str(node.key or "").strip()
+        new_value = str(node.value or "").strip()
+        return old_key != new_key or old_value != new_value
+
+    def _maybe_update_children_for_region_updates(
+        self,
+        update_info: str,
+        world_decisions: list[ActionDecision],
+        world_nodes: list[WorldNode],
+        world_snapshot: dict[str, Dict[str, object]],
+    ) -> tuple[list[ActionDecision], list[WorldNode]]:
+        if not self.world_agent:
+            return [], []
+        regions = self._collect_updated_regions(
+            world_decisions, world_nodes, world_snapshot
+        )
+        if not regions:
+            return [], []
+        skip_ids = {decision.index for decision in world_decisions}
+        decisions: list[ActionDecision] = []
+        nodes: list[WorldNode] = []
+        for region in regions:
+            if not region.children:
+                continue
+            prompt = self._build_region_children_decision_prompt(
+                update_info, region, world_snapshot
+            )
+            response = self._chat_once(
+                prompt,
+                system_prompt=self._system_prompt(),
+                log_label="GAME_REGION_CHILDREN_DECIDE",
+            )
+            should_update, reason = self._parse_region_children_decision(response)
+            if not should_update:
+                self.logger.info(
+                    "region_children_skip region=%s reason=%s",
+                    region.identifier,
+                    reason,
+                )
+                continue
+            payload = self._build_region_child_update_payload(
+                update_info, region, world_snapshot
+            )
+            updated_count = 0
+            for child in region.children.values():
+                if child.identifier in skip_ids:
+                    continue
+                decision = ActionDecision(
+                    flag=WORLD_UPDATE_TAG,
+                    index=child.identifier,
+                    raw="region_children",
+                )
+                node = self.world_agent.apply_update(
+                    decision.flag, decision.index, payload
+                )
+                decisions.append(decision)
+                nodes.append(node)
+                updated_count += 1
+            if updated_count:
+                self.logger.info(
+                    "region_children_update region=%s children=%s",
+                    region.identifier,
+                    updated_count,
+                )
+        return decisions, nodes
+
+    def _build_region_children_decision_prompt(
+        self,
+        update_info: str,
+        region: WorldNode,
+        world_snapshot: dict[str, Dict[str, object]],
+    ) -> str:
+        before = world_snapshot.get(region.identifier, {})
+        before_value = _truncate_text(str(before.get("value", "")).strip(), limit=240)
+        after_value = _truncate_text(str(region.value or "").strip(), limit=240)
+        children = [
+            f"{child.identifier} {child.key}".strip()
+            for child in region.children.values()
+        ]
+        child_text = "、".join(children) if children else "无"
+        return "\n".join(
+            [
+                "【任务】判断是否需要更新地区子节点",
+                "地区节点发生变化时，判断是否需要把变化同步到所有子节点。",
+                "只输出一行JSON：",
+                '{"update_children":true|false,"reason":"..."}',
+                f"地区节点：{region.identifier} {region.key}",
+                f"原内容：{before_value or '无'}",
+                f"新内容：{after_value or '无'}",
+                f"子节点：{child_text}",
+                f"剧情信息：{update_info.strip()}",
+            ]
+        )
+
+    def _parse_region_children_decision(self, response: str) -> tuple[bool, str]:
+        for line in response.splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            if cleaned.startswith("{") and cleaned.endswith("}"):
+                try:
+                    data = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    continue
+                decision = self._coerce_bool(data.get("update_children"))
+                if decision is not None:
+                    return decision, str(data.get("reason", "")).strip()
+        for token in response.replace(",", " ").replace(";", " ").split():
+            decision = self._coerce_bool(token)
+            if decision is not None:
+                return decision, ""
+        return False, ""
+
+    def _build_region_child_update_payload(
+        self,
+        update_info: str,
+        region: WorldNode,
+        world_snapshot: dict[str, Dict[str, object]],
+    ) -> str:
+        before = world_snapshot.get(region.identifier, {})
+        before_key = str(before.get("key", "")).strip()
+        before_value = _truncate_text(str(before.get("value", "")).strip(), limit=320)
+        after_value = _truncate_text(str(region.value or "").strip(), limit=320)
+        if before_key and before_key != region.key:
+            key_line = f"地区节点变化：{before_key} -> {region.key}"
+        else:
+            key_line = f"地区节点：{region.key}"
+        lines = [
+            update_info.strip(),
+            key_line,
+            f"原内容：{before_value or '无'}",
+            f"新内容：{after_value or '无'}",
+            "请根据地区变化更新该子节点内容。",
+        ]
+        return "\n".join(line for line in lines if line)
 
     def _find_characters_for_polities(
         self, polities: list[WorldNode]
@@ -1043,6 +1269,114 @@ class GameAgent:
         if not item:
             return f"- {record.identifier}".strip()
         return f"- {item}".strip()
+
+    def _snapshot_world(self) -> dict[str, Dict[str, object]]:
+        if not self.world_agent:
+            return {}
+        snapshot: dict[str, Dict[str, object]] = {}
+        for node in self.world_agent.engine.nodes.values():
+            snapshot[node.identifier] = {
+                "key": node.key,
+                "value": node.value,
+                "children": sorted(node.children.keys()),
+            }
+        return snapshot
+
+    def _snapshot_characters(self) -> dict[str, Dict[str, object] | str]:
+        if not self.character_agent:
+            return {}
+        snapshot: dict[str, Dict[str, object] | str] = {}
+        for record in self.character_agent.engine.records:
+            profile = record.profile
+            if isinstance(profile, dict):
+                snapshot[record.identifier] = copy.deepcopy(profile)
+            else:
+                snapshot[record.identifier] = str(profile or "")
+        return snapshot
+
+    def _build_world_changes(
+        self,
+        decisions: list[ActionDecision],
+        nodes: list[WorldNode],
+        snapshot: dict[str, Dict[str, object]],
+    ) -> list[HistoryChange]:
+        changes: list[HistoryChange] = []
+        for idx, decision in enumerate(decisions):
+            action = self._normalize_action_name(decision.flag)
+            node = nodes[idx] if idx < len(nodes) else None
+            identifier = node.identifier if node else decision.index
+            before = snapshot.get(identifier)
+            after: Dict[str, object] | None = None
+            if node and action != "REMOVE_NODE":
+                after = {
+                    "key": node.key,
+                    "value": node.value,
+                    "children": sorted(node.children.keys()),
+                }
+            change = HistoryChange(
+                kind="world",
+                action=action,
+                identifier=identifier,
+                before=before,
+                after=after,
+            )
+            changes.append(change)
+        return changes
+
+    def _build_character_changes(
+        self,
+        decisions: list[CharacterActionDecision],
+        records: list[CharacterRecord],
+        snapshot: dict[str, Dict[str, object] | str],
+    ) -> list[HistoryChange]:
+        changes: list[HistoryChange] = []
+        for idx, decision in enumerate(decisions):
+            action = self._normalize_action_name(decision.flag)
+            record = records[idx] if idx < len(records) else None
+            identifier = record.identifier if record else decision.identifier
+            before = snapshot.get(identifier)
+            after: Dict[str, object] | str | None = None
+            if record:
+                if isinstance(record.profile, dict):
+                    after = copy.deepcopy(record.profile)
+                else:
+                    after = str(record.profile or "")
+            change = HistoryChange(
+                kind="character",
+                action=action,
+                identifier=identifier,
+                before=before if isinstance(before, dict) else {"raw": before} if before else None,
+                after=after if isinstance(after, dict) else {"raw": after} if after else None,
+            )
+            changes.append(change)
+        return changes
+
+    def _record_history(
+        self,
+        update_info: str,
+        result: GameUpdateResult,
+        world_snapshot: dict[str, Dict[str, object]],
+        character_snapshot: dict[str, Dict[str, object] | str],
+    ) -> None:
+        if not self.history_engine:
+            return
+        decision_payload = {
+            "update_world": result.decision.update_world,
+            "update_characters": result.decision.update_characters,
+            "reason": result.decision.reason,
+        }
+        world_changes = self._build_world_changes(
+            result.world_decisions, result.world_nodes, world_snapshot
+        )
+        character_changes = self._build_character_changes(
+            result.character_decisions, result.character_records, character_snapshot
+        )
+        self.history_engine.record(
+            update_info,
+            decision_payload,
+            world_changes,
+            character_changes,
+        )
 
     def _normalize_action_name(self, flag: str) -> str:
         cleaned = flag.strip()
